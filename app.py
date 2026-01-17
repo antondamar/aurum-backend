@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yfinance as yf
 from openai import OpenAI
+import json
 
 app = Flask(__name__)
 CORS(app) # Mandatory for cross-origin requests from React
@@ -72,30 +73,39 @@ def get_ai_insight():
     if not symbol:
         return jsonify({"error": "Symbol is required"}), 400
     
+    # yfinance often requires -USD for crypto
+    api_symbol = f"{symbol}-USD" if symbol in ['BTC', 'ETH', 'SOL'] else symbol
+
     try:
-        # 1. Fetch 30 days of historical data
-        ticker = yf.Ticker(symbol)
+        ticker = yf.Ticker(api_symbol)
         df = ticker.history(period="1mo")
         
-        # 2. Format data into a compact string to save tokens
-        # Date, Close, High, Low
+        if df.empty:
+            return jsonify({"error": f"No data found for {api_symbol}"}), 404
+        
         data_summary = df.tail(30).to_csv(columns=['Close', 'High', 'Low'])
 
-        # 3. Call OpenAI (using gpt-4o-mini for speed and cost)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a senior financial analyst specializing in technical analysis and pattern recognition."},
-                {"role": "user", "content": f"Analyze the following 30-day OHLC data for {symbol}:\n{data_summary}\n\nTasks:\n1. Identify trend (Bullish/Bearish/Sideways).\n2. Spot patterns (Support/Resistance, Breakouts).\n3. Give a Sentiment Score (1-100).\n4. Provide a 2-sentence 'Executive Verdict'."}
+                {
+                    "role": "system", 
+                    "content": "You are a senior financial analyst. ALWAYS respond in valid JSON format." # "JSON" keyword added here
+                },
+                {
+                    "role": "user", 
+                    "content": f"Analyze this 30-day OHLC data for {api_symbol} and return a JSON object with keys 'trend', 'patterns', 'sentiment_score', 'verdict', and 'suggestion':\n{data_summary}"
+                }
             ],
-            response_format={ "type": "json_object" } # Ensures we get clean JSON back
+            response_format={ "type": "json_object" }
         )
         
-        # Parse the AI response
-        ai_analysis = response.choices[0].message.content
-        return ai_analysis # This will return a JSON object to your React app
+        # Parse the string into a dictionary so jsonify can handle it correctly
+        ai_data = json.loads(response.choices[0].message.content)
+        return jsonify(ai_data)
 
     except Exception as e:
+        print(f"Error: {str(e)}") # This will show up in your Render logs
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
