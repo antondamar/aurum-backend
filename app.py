@@ -11,12 +11,23 @@ from datetime import datetime, timedelta
 import requests
 import time
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from yfinance.shared import YahooFinanceException
 import random
 from functools import lru_cache
 
+# Try different import approaches for YahooFinanceException
+try:
+    from yfinance.shared import YahooFinanceException
+except ImportError:
+    try:
+        from yfinance import YahooFinanceException
+    except ImportError:
+        # Create a custom exception if import fails
+        class YahooFinanceException(Exception):
+            pass
+
 # ==================== ALPHA VANTAGE SETUP ====================
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
+
 
 # 1. SETUP SESSION (Prevents Rate Limits)
 session = requests.Session()
