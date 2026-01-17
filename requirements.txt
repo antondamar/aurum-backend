@@ -3,3 +3,5 @@ flask-cors
 yfinance
 openai
 gunicorn
+pandas
+firebase-admin
