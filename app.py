@@ -14,20 +14,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 import random
 from functools import lru_cache
 
-# Try different import approaches for YahooFinanceException
-try:
-    from yfinance.shared import YahooFinanceException
-except ImportError:
-    try:
-        from yfinance import YahooFinanceException
-    except ImportError:
-        # Create a custom exception if import fails
-        class YahooFinanceException(Exception):
-            pass
-
 # ==================== ALPHA VANTAGE SETUP ====================
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
-
 
 # 1. SETUP SESSION (Prevents Rate Limits)
 session = requests.Session()
@@ -275,7 +263,7 @@ def df_to_list(df):
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type((YahooFinanceException, ConnectionError)),
+    retry=retry_if_exception_type((Exception, ConnectionError, TimeoutError)),
     before_sleep=lambda retry_state: print(f"Retrying yfinance request... Attempt {retry_state.attempt_number}")
 )
 def safe_yf_download(symbol, start, interval, session):
@@ -400,12 +388,15 @@ def get_historical_data():
                 "source": "alpha_vantage" if ALPHA_VANTAGE_API_KEY and new_data_daily else "yfinance"
             })
             
-        except YahooFinanceException as e:
-            return jsonify({
-                "error": "Data source rate limit exceeded",
-                "message": "Please try again in 30 minutes",
-                "retry_after": 1800
-            }), 429
+        except Exception as e:  # Changed from YahooFinanceException
+            if "rate limit" in str(e).lower() or "too many requests" in str(e).lower():
+                return jsonify({
+                    "error": "Data source rate limit exceeded",
+                    "message": "Please try again in 30 minutes",
+                    "retry_after": 1800
+                }), 429
+            else:
+                raise e
             
     except Exception as e:
         print(f"Error in get-historical-data for {symbol}: {str(e)}")
