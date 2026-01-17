@@ -12,7 +12,6 @@ import requests
 import time
 import random
 import numpy as np
-import talib
 from typing import Dict, List, Optional, Tuple
 
 # ==================== CONFIGURATION ====================
@@ -90,17 +89,17 @@ def calculate_moving_averages(df: pd.DataFrame) -> Dict:
         if len(df) >= 200:
             closes = df['close'].values
             
-            # Calculate all moving averages
-            ma20 = talib.SMA(closes, timeperiod=20)
-            ma50 = talib.SMA(closes, timeperiod=50)
-            ma200 = talib.SMA(closes, timeperiod=200)
+            # Calculate moving averages using pandas rolling
+            ma20 = pd.Series(closes).rolling(window=20).mean()
+            ma50 = pd.Series(closes).rolling(window=50).mean()
+            ma200 = pd.Series(closes).rolling(window=200).mean()
             
             current_price = float(closes[-1])
             
             # Get last valid values
-            ma20_val = float(ma20[-1]) if not np.isnan(ma20[-1]) else 0
-            ma50_val = float(ma50[-1]) if not np.isnan(ma50[-1]) else 0
-            ma200_val = float(ma200[-1]) if not np.isnan(ma200[-1]) else 0
+            ma20_val = float(ma20.iloc[-1]) if not pd.isna(ma20.iloc[-1]) else 0
+            ma50_val = float(ma50.iloc[-1]) if not pd.isna(ma50.iloc[-1]) else 0
+            ma200_val = float(ma200.iloc[-1]) if not pd.isna(ma200.iloc[-1]) else 0
             
             # Determine trend
             if ma20_val > 0 and ma50_val > 0 and ma200_val > 0:
@@ -297,45 +296,143 @@ def get_fibonacci_description(level1: str, level2: str) -> str:
     return zones.get((level1, level2), "Standard Fibonacci retracement level")
 
 def detect_candlestick_patterns(df: pd.DataFrame) -> List[str]:
-    """Detect common candlestick patterns using TA-Lib"""
+    """Detect common candlestick patterns without TA-Lib"""
     patterns = []
     
     try:
         if len(df) < 40:
             return ["Insufficient data for pattern recognition"]
         
+        # Get recent data (last 40 days for pattern detection)
+        recent_data = df.tail(40)
+        
         # Extract OHLC data
-        opens = df['open'].values if 'open' in df.columns else df['close'].values * 0.99  # Estimate if not available
-        highs = df['high'].values if 'high' in df.columns else df['close'].values * 1.01
-        lows = df['low'].values if 'low' in df.columns else df['close'].values * 0.99
-        closes = df['close'].values
+        if 'open' in recent_data.columns and 'high' in recent_data.columns and 'low' in recent_data.columns:
+            opens = recent_data['open'].values
+            highs = recent_data['high'].values
+            lows = recent_data['low'].values
+            closes = recent_data['close'].values
+        else:
+            # Estimate if not available
+            closes = recent_data['close'].values
+            opens = closes * 0.99
+            highs = closes * 1.01
+            lows = closes * 0.99
         
-        # Pattern detection
-        pattern_functions = [
-            (talib.CDLENGULFING, "Engulfing Pattern"),
-            (talib.CDLHAMMER, "Hammer"),
-            (talib.CDLHANGINGMAN, "Hanging Man"),
-            (talib.CDLDOJI, "Doji"),
-            (talib.CDLMORNINGSTAR, "Morning Star"),
-            (talib.CDLEVENINGSTAR, "Evening Star"),
-            (talib.CDLHARAMI, "Harami Pattern"),
-            (talib.CDLSHOOTINGSTAR, "Shooting Star"),
-            (talib.CDLINVERTEDHAMMER, "Inverted Hammer"),
-            (talib.CDLPIERCING, "Piercing Pattern"),
-            (talib.CDLDARKCLOUDCOVER, "Dark Cloud Cover"),
-            (talib.CDL3WHITESOLDIERS, "Three White Soldiers"),
-            (talib.CDL3BLACKCROWS, "Three Black Crows")
-        ]
+        # Get last 5 days for pattern detection
+        last_idx = len(closes) - 1
         
-        for pattern_func, pattern_name in pattern_functions:
-            result = pattern_func(opens, highs, lows, closes)
-            if result[-1] != 0:  # Non-zero indicates pattern detected
-                if result[-1] > 0:
-                    patterns.append(f"Bullish {pattern_name}")
-                else:
-                    patterns.append(f"Bearish {pattern_name}")
+        if last_idx >= 4:  # Need at least 5 days
+            # Bullish Engulfing Pattern
+            if (closes[last_idx-1] < opens[last_idx-1] and  # Previous day is bearish
+                closes[last_idx] > opens[last_idx] and      # Current day is bullish
+                opens[last_idx] < closes[last_idx-1] and    # Open below previous close
+                closes[last_idx] > opens[last_idx-1]):      # Close above previous open
+                patterns.append("Bullish Engulfing Pattern")
+            
+            # Bearish Engulfing Pattern
+            elif (closes[last_idx-1] > opens[last_idx-1] and  # Previous day is bullish
+                  closes[last_idx] < opens[last_idx] and      # Current day is bearish
+                  opens[last_idx] > closes[last_idx-1] and    # Open above previous close
+                  closes[last_idx] < opens[last_idx-1]):      # Close below previous open
+                patterns.append("Bearish Engulfing Pattern")
+            
+            # Hammer
+            body = abs(closes[last_idx] - opens[last_idx])
+            lower_shadow = min(opens[last_idx], closes[last_idx]) - lows[last_idx]
+            upper_shadow = highs[last_idx] - max(opens[last_idx], closes[last_idx])
+            
+            if (lower_shadow > body * 2 and  # Long lower shadow
+                upper_shadow < body * 0.1 and  # Small or no upper shadow
+                closes[last_idx] > opens[last_idx]):  # Bullish close
+                patterns.append("Bullish Hammer")
+            
+            # Hanging Man (similar to hammer but after uptrend)
+            if (lower_shadow > body * 2 and  # Long lower shadow
+                upper_shadow < body * 0.1 and  # Small or no upper shadow
+                closes[last_idx] < opens[last_idx] and  # Bearish close
+                closes[last_idx-5:last_idx].mean() < closes[last_idx]):  # In uptrend
+                patterns.append("Bearish Hanging Man")
+            
+            # Doji
+            if body < (highs[last_idx] - lows[last_idx]) * 0.1:  # Very small body
+                patterns.append("Doji Pattern")
+            
+            # Shooting Star
+            if (upper_shadow > body * 2 and  # Long upper shadow
+                lower_shadow < body * 0.1 and  # Small or no lower shadow
+                closes[last_idx] < opens[last_idx]):  # Bearish close
+                patterns.append("Bearish Shooting Star")
+            
+            # Inverted Hammer
+            if (upper_shadow > body * 2 and  # Long upper shadow
+                lower_shadow < body * 0.1 and  # Small or no lower shadow
+                closes[last_idx] > opens[last_idx]):  # Bullish close
+                patterns.append("Bullish Inverted Hammer")
         
-        # Additional pattern detection
+        # Multi-day patterns (need at least 3 days)
+        if last_idx >= 2:
+            # Morning Star (3-day pattern)
+            if (closes[last_idx-2] < opens[last_idx-2] and  # Day 1: bearish
+                abs(closes[last_idx-1] - opens[last_idx-1]) < (highs[last_idx-1] - lows[last_idx-1]) * 0.3 and  # Day 2: small body
+                closes[last_idx] > opens[last_idx] and  # Day 3: bullish
+                closes[last_idx] > (opens[last_idx-2] + closes[last_idx-2]) / 2):  # Closes above midpoint of Day 1
+                patterns.append("Bullish Morning Star")
+            
+            # Evening Star (3-day pattern)
+            if (closes[last_idx-2] > opens[last_idx-2] and  # Day 1: bullish
+                abs(closes[last_idx-1] - opens[last_idx-1]) < (highs[last_idx-1] - lows[last_idx-1]) * 0.3 and  # Day 2: small body
+                closes[last_idx] < opens[last_idx] and  # Day 3: bearish
+                closes[last_idx] < (opens[last_idx-2] + closes[last_idx-2]) / 2):  # Closes below midpoint of Day 1
+                patterns.append("Bearish Evening Star")
+            
+            # Three White Soldiers (3 consecutive bullish candles)
+            if all(closes[i] > opens[i] for i in range(last_idx-2, last_idx+1)):
+                if (closes[last_idx-2] > opens[last_idx-2] and
+                    closes[last_idx-1] > closes[last_idx-2] and
+                    closes[last_idx] > closes[last_idx-1]):
+                    patterns.append("Bullish Three White Soldiers")
+            
+            # Three Black Crows (3 consecutive bearish candles)
+            if all(closes[i] < opens[i] for i in range(last_idx-2, last_idx+1)):
+                if (closes[last_idx-2] < opens[last_idx-2] and
+                    closes[last_idx-1] < closes[last_idx-2] and
+                    closes[last_idx] < closes[last_idx-1]):
+                    patterns.append("Bearish Three Black Crows")
+            
+            # Harami Pattern (2-day)
+            body_day1 = abs(closes[last_idx-1] - opens[last_idx-1])
+            body_day2 = abs(closes[last_idx] - opens[last_idx])
+            
+            if body_day1 > body_day2 * 2:  # Day 1 has much larger body
+                # Bullish Harami
+                if (closes[last_idx-1] < opens[last_idx-1] and  # Day 1 bearish
+                    closes[last_idx] > opens[last_idx] and      # Day 2 bullish
+                    opens[last_idx] > closes[last_idx-1] and    # Day 2 open above Day 1 close
+                    closes[last_idx] < opens[last_idx-1]):      # Day 2 close below Day 1 open
+                    patterns.append("Bullish Harami Pattern")
+                # Bearish Harami
+                elif (closes[last_idx-1] > opens[last_idx-1] and  # Day 1 bullish
+                      closes[last_idx] < opens[last_idx] and      # Day 2 bearish
+                      opens[last_idx] < closes[last_idx-1] and    # Day 2 open below Day 1 close
+                      closes[last_idx] > opens[last_idx-1]):      # Day 2 close above Day 1 open
+                    patterns.append("Bearish Harami Pattern")
+            
+            # Piercing Pattern (2-day)
+            if (closes[last_idx-1] < opens[last_idx-1] and  # Day 1 bearish
+                closes[last_idx] > opens[last_idx] and      # Day 2 bullish
+                opens[last_idx] < closes[last_idx-1] and    # Day 2 open below Day 1 close
+                closes[last_idx] > (opens[last_idx-1] + closes[last_idx-1]) / 2):  # Closes above midpoint
+                patterns.append("Bullish Piercing Pattern")
+            
+            # Dark Cloud Cover (2-day)
+            if (closes[last_idx-1] > opens[last_idx-1] and  # Day 1 bullish
+                closes[last_idx] < opens[last_idx] and      # Day 2 bearish
+                opens[last_idx] > closes[last_idx-1] and    # Day 2 open above Day 1 close
+                closes[last_idx] < (opens[last_idx-1] + closes[last_idx-1]) / 2):  # Closes below midpoint
+                patterns.append("Bearish Dark Cloud Cover")
+        
+        # Add chart patterns
         patterns.extend(detect_chart_patterns(df))
         
         return patterns if patterns else ["No strong candlestick patterns detected"]
