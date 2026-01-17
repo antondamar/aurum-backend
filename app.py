@@ -539,31 +539,11 @@ def calculate_support_resistance(df: pd.DataFrame) -> Dict:
             'closest_level': "Calculation error",
             'strength': "Unknown"
         }
-
-# ==================== ENDPOINTS ====================
-
-@app.route('/get-historical-data', methods=['GET'])
-def get_historical_data():
-    """Sync historical data with proper OHLC"""
-    symbol = request.args.get('symbol')
-    if not symbol:
-        return jsonify({"error": "Symbol parameter is required"}), 400
     
+
+def sync_historical_data(symbol: str, api_symbol: str) -> Dict:
+    """Internal function to sync historical data"""
     try:
-        api_symbol = get_api_symbol(symbol)
-        if not api_symbol:
-            return jsonify({"error": "Invalid symbol"}), 400
-        
-        # Determine period based on existing data
-        asset_ref = db.collection('historical_data').document(api_symbol)
-        doc = asset_ref.get()
-        
-        existing_data = []
-        if doc.exists:
-            data_dict = doc.to_dict()
-            existing_data = data_dict.get('daily', []) if data_dict else []
-        
-        # Always fetch fresh data for accuracy
         ticker = yf.Ticker(api_symbol, session=session)
         
         # For crypto, try to get OHLC data
@@ -585,23 +565,75 @@ def get_historical_data():
             })
         
         # Update Firebase with new data
+        asset_ref = db.collection('historical_data').document(api_symbol)
         asset_ref.set({
             "daily": new_data,
             "symbol": symbol,
             "last_synced": datetime.now().isoformat(),
             "data_points": len(new_data)
-        }, merge=False)  # Replace entirely for fresh data
+        }, merge=False)
+        
+        return {
+            "success": True,
+            "data_points": len(new_data),
+            "message": f"Synced {len(new_data)} days of data for {symbol}"
+        }
+        
+    except Exception as e:
+        print(f"Sync error: {e}")
+        return {"success": False, "error": str(e)}
+
+# ==================== ENDPOINTS ====================
+
+@app.route('/get-historical-data', methods=['GET'])
+def get_historical_data():
+    symbol = request.args.get('symbol')
+    if not symbol:
+        return jsonify({"error": "Symbol parameter is required"}), 400
+    
+    try:
+        api_symbol = get_api_symbol(symbol)
+        ticker = yf.Ticker(api_symbol, session=session)
+        
+        # 1. Attempt download
+        hist = ticker.history(period="2y", interval="1d")
+        
+        # 2. CRITICAL CHECK: If hist is empty, Yahoo has blocked the request
+        if hist.empty:
+            return jsonify({
+                "status": "error",
+                "message": "Yahoo Finance returned no data. You are likely being rate-limited.",
+                "symbol": symbol
+            }), 503  # Service Unavailable
+
+        new_data = []
+        for date, row in hist.iterrows():
+            new_data.append({
+                "date": date.strftime('%Y-%m-%d'),
+                "open": float(round(row['Open'], 2)),
+                "high": float(round(row['High'], 2)),
+                "low": float(round(row['Low'], 2)),
+                "close": float(round(row['Close'], 2)),
+                "volume": int(row['Volume']) if 'Volume' in row else 0
+            })
+        
+        # 3. Only save to Firebase if we actually have data
+        asset_ref = db.collection('historical_data').document(api_symbol)
+        asset_ref.set({
+            "daily": new_data,
+            "symbol": symbol,
+            "last_synced": datetime.now().isoformat(),
+            "data_points": len(new_data)
+        }, merge=False)
         
         return jsonify({
             "status": "synced",
             "symbol": symbol,
             "data_points": len(new_data),
-            "period": f"{len(new_data)} days",
-            "message": "Data refreshed successfully"
+            "period": f"{len(new_data)} days"
         })
         
     except Exception as e:
-        print(f"Historical data sync error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/get-ai-insight', methods=['GET'])
@@ -628,15 +660,25 @@ def get_ai_insight():
     try:
         # Get data from Firebase
         asset_doc = db.collection('historical_data').document(api_symbol).get()
-        if not asset_doc.exists:
-            return jsonify({"error": "No data found. Sync first using /get-historical-data"}), 404
+        
+        # If no data exists, fetch it first
+        if not asset_doc.exists or not asset_doc.to_dict().get('daily'):
+            # Call the sync function internally
+            sync_result = sync_historical_data(symbol, api_symbol)
+            if not sync_result.get('success', False):
+                return jsonify({
+                    "error": f"Failed to fetch historical data for {symbol}",
+                    "message": "Please try again or use /get-historical-data first"
+                }), 500
+            
+            # Re-fetch the document
+            asset_doc = db.collection('historical_data').document(api_symbol).get()
         
         data_dict = asset_doc.to_dict()
         full_data = data_dict.get('daily', [])
         
         if not full_data:
-            return jsonify({"error": "No daily data available. Please sync first."}), 404
-        
+            return jsonify({"error": "No daily data available after sync. Please try again."}), 404
         # Convert to DataFrame
         df = pd.DataFrame(full_data)
         
