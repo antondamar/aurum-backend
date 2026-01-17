@@ -10,9 +10,8 @@ from firebase_admin import credentials, firestore
 from datetime import datetime, timedelta
 import requests
 import time
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import random
-from functools import lru_cache
+import numpy as np
 
 # ==================== ALPHA VANTAGE SETUP ====================
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
@@ -33,298 +32,140 @@ db = firestore.client()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def get_api_symbol(symbol):
-    """Convert symbol to API-specific format"""
-    if symbol in ['BTC', 'ETH', 'SOL', 'BNB'] and not symbol.endswith('-USD'):
-        return f"{symbol}-USD"
-    if any(s in symbol for s in ['BBCA', 'TLKM', 'ASII']) and not symbol.endswith('.JK'):
-        return f"{symbol}.JK"
-    return symbol
+    """Convert symbol to yfinance format"""
+    s = symbol.upper()
+    cryptos = ['BTC', 'ETH', 'BNB', 'SOL', 'ADA', 'XRP', 'DOGE', 'DOT', 'LINK', 'LTC']
+    if s in cryptos:
+        return f"{s}-USD"
+    return s
 
-def get_alpha_vantage_symbol(symbol):
-    """Convert symbol to Alpha Vantage format"""
-    # Alpha Vantage uses different formats for crypto
-    crypto_map = {
-        'BTC': 'BTC',
-        'ETH': 'ETH',
-        'SOL': 'SOL',
-        'BNB': 'BNB'
+# ==================== TECHNICAL ANALYSIS FUNCTIONS ====================
+
+def calculate_fibonacci_retracement(df):
+    """Calculate Fibonacci retracement levels"""
+    if len(df) < 20:
+        return None
+    
+    # Use last 20 days for swing high/low
+    recent_data = df.tail(20)
+    swing_high = recent_data['close'].max()
+    swing_low = recent_data['close'].min()
+    
+    # Fibonacci levels
+    diff = swing_high - swing_low
+    levels = {
+        'swing_high': swing_high,
+        'swing_low': swing_low,
+        '0.236': swing_high - diff * 0.236,
+        '0.382': swing_high - diff * 0.382,
+        '0.5': swing_high - diff * 0.5,
+        '0.618': swing_high - diff * 0.618,
+        '0.786': swing_high - diff * 0.786,
+        '1.0': swing_low
     }
     
-    if symbol in crypto_map:
-        return crypto_map[symbol]
+    # Current position relative to Fibonacci levels
+    current_price = df['close'].iloc[-1]
     
-    # For stocks, add exchange suffix if needed
-    if symbol in ['BBCA', 'TLKM', 'ASII']:
-        return f"{symbol}.JK"
+    # Find which Fibonacci zone current price is in
+    fib_zones = list(levels.values())
+    fib_zones.sort(reverse=True)
     
-    return symbol
+    current_zone = None
+    for i in range(len(fib_zones)-1):
+        if fib_zones[i] >= current_price >= fib_zones[i+1]:
+            # Determine the Fibonacci level
+            for key, value in levels.items():
+                if abs(value - fib_zones[i]) < 0.001:
+                    if key in ['0.382', '0.5', '0.618']:
+                        current_zone = f"Fibonacci {key} retracement zone"
+                    else:
+                        current_zone = f"Near {key} level"
+                    break
+            break
+    
+    return {
+        'levels': levels,
+        'current_price': current_price,
+        'current_zone': current_zone or "Outside main Fibonacci zones",
+        'distance_from_high': round(((swing_high - current_price) / diff) * 100, 2) if diff > 0 else 0,
+        'distance_from_low': round(((current_price - swing_low) / diff) * 100, 2) if diff > 0 else 0
+    }
 
-# ==================== ALPHA VANTAGE FUNCTIONS ====================
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type((ConnectionError, TimeoutError)),
-)
-def get_alpha_vantage_price(symbol):
-    """Get current price from Alpha Vantage"""
-    if not ALPHA_VANTAGE_API_KEY:
-        return None
+def calculate_moving_averages(df):
+    """Calculate various moving averages"""
+    ma_data = {}
     
-    av_symbol = get_alpha_vantage_symbol(symbol)
-    
-    try:
-        # For crypto
-        if symbol in ['BTC', 'ETH', 'SOL', 'BNB']:
-            url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={av_symbol}&to_currency=USD&apikey={ALPHA_VANTAGE_API_KEY}"
-            response = session.get(url, timeout=10)
-            data = response.json()
-            
-            if "Realtime Currency Exchange Rate" in data:
-                return float(data["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
+    # Ensure we have enough data
+    if len(df) >= 50:
+        df = df.copy()
+        ma_data['MA20'] = round(df['close'].rolling(window=20).mean().iloc[-1], 2)
+        ma_data['MA50'] = round(df['close'].rolling(window=50).mean().iloc[-1], 2)
+        ma_data['MA200'] = round(df['close'].rolling(window=200).mean().iloc[-1], 2)
         
-        # For stocks
-        else:
-            url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={av_symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
-            response = session.get(url, timeout=10)
-            data = response.json()
-            
-            if "Global Quote" in data and data["Global Quote"]:
-                return float(data["Global Quote"]["05. price"])
+        # Determine MA trend
+        current_price = df['close'].iloc[-1]
+        ma_data['ma_trend'] = "Bullish" if current_price > ma_data['MA20'] > ma_data['MA50'] else "Bearish"
+        ma_data['golden_cross'] = ma_data['MA50'] > ma_data['MA200']
+        ma_data['price_vs_ma20'] = "Above" if current_price > ma_data['MA20'] else "Below"
     
-    except Exception as e:
-        print(f"Alpha Vantage error for {symbol}: {str(e)}")
-    
-    return None
+    return ma_data
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type((ConnectionError, TimeoutError)),
-)
-def get_alpha_vantage_historical(symbol, start_date="2013-01-01"):
-    """Get historical data from Alpha Vantage"""
-    if not ALPHA_VANTAGE_API_KEY:
-        return None
+def analyze_support_resistance(df):
+    """Identify key support and resistance levels"""
+    if len(df) < 30:
+        return {}
     
-    av_symbol = get_alpha_vantage_symbol(symbol)
+    recent = df.tail(30)
     
-    try:
-        # Determine function based on symbol type
-        if symbol in ['BTC', 'ETH', 'SOL', 'BNB']:
-            function = "DIGITAL_CURRENCY_DAILY"
-            market = "USD"
-            url = f"https://www.alphavantage.co/query?function={function}&symbol={av_symbol}&market={market}&apikey={ALPHA_VANTAGE_API_KEY}"
-        else:
-            function = "TIME_SERIES_DAILY"
-            url = f"https://www.alphavantage.co/query?function={function}&symbol={av_symbol}&outputsize=full&apikey={ALPHA_VANTAGE_API_KEY}"
-        
-        response = session.get(url, timeout=10)
-        data = response.json()
-        
-        if "Error Message" in data:
-            print(f"Alpha Vantage error: {data['Error Message']}")
-            return None
-        
-        # Parse response based on function
-        if symbol in ['BTC', 'ETH', 'SOL', 'BNB']:
-            time_series = data.get("Time Series (Digital Currency Daily)", {})
-        else:
-            time_series = data.get("Time Series (Daily)", {})
-        
-        # Convert to list of dicts
-        historical_data = []
-        for date_str, values in time_series.items():
-            if date_str < start_date:
-                continue
-            
-            try:
-                if symbol in ['BTC', 'ETH', 'SOL', 'BNB']:
-                    close_price = float(values.get(f"4a. close (USD)", 0))
-                else:
-                    close_price = float(values.get("4. close", 0))
-                
-                historical_data.append({
-                    "date": date_str,
-                    "close": round(close_price, 2)
-                })
-            except:
-                continue
-        
-        # Sort by date
-        historical_data.sort(key=lambda x: x['date'])
-        return historical_data
+    # Simple support/resistance detection
+    closes = recent['close'].values
+    resistance = np.max(closes[-10:])  # Recent high
+    support = np.min(closes[-10:])     # Recent low
     
-    except Exception as e:
-        print(f"Alpha Vantage historical error for {symbol}: {str(e)}")
+    current_price = closes[-1]
+    distance_to_resistance = round(((resistance - current_price) / current_price) * 100, 2)
+    distance_to_support = round(((current_price - support) / current_price) * 100, 2)
     
-    return None
-
-# ==================== HYBRID PRICE FUNCTIONS ====================
-
-def get_price_safe(symbol):
-    """Get price from multiple sources with fallback"""
-    sources = [
-        get_cached_price,          # Firebase cache first
-        get_alpha_vantage_price,   # Alpha Vantage second
-        get_yfinance_price_fallback # yFinance as last resort
-    ]
-    
-    for source in sources:
-        try:
-            price = source(symbol)
-            if price and price > 0:
-                return price
-        except Exception as e:
-            print(f"Price source failed ({source.__name__}): {str(e)}")
-            continue
-    
-    return 0
-
-def get_yfinance_price_fallback(symbol):
-    """Fallback to yfinance"""
-    try:
-        ticker = yf.Ticker(get_api_symbol(symbol), session=session)
-        price = ticker.fast_info.get('last_price', 0)
-        return price if price and price > 0 else None
-    except:
-        return None
-
-@lru_cache(maxsize=100)
-def get_cached_price(symbol, expiry_minutes=5):
-    """Cache price data with multi-source support"""
-    cache_key = f"price_{symbol}"
-    cache_ref = db.collection('cache').document(cache_key)
-    cache_doc = cache_ref.get()
-    
-    if cache_doc.exists:
-        cache_data = cache_doc.to_dict()
-        cached_time = datetime.fromisoformat(cache_data['timestamp'])
-        if datetime.now() - cached_time < timedelta(minutes=expiry_minutes):
-            return cache_data['price']
-    
-    # Get fresh price from best available source
-    price = None
-    
-    # Try Alpha Vantage first (more reliable)
-    if ALPHA_VANTAGE_API_KEY:
-        price = get_alpha_vantage_price(symbol)
-    
-    # Fallback to yfinance
-    if not price or price == 0:
-        price = get_yfinance_price_fallback(symbol)
-    
-    if price and price > 0:
-        cache_ref.set({
-            'price': price,
-            'timestamp': datetime.now().isoformat(),
-            'symbol': symbol,
-            'source': 'alpha_vantage' if ALPHA_VANTAGE_API_KEY else 'yfinance'
-        })
-    
-    return price or 0
-
-# ==================== HELPER FUNCTIONS ====================
-
-def df_to_list(df):
-    if df.empty:
-        return []
-    
-    data_list = []
-    for date, row in df.iterrows():
-        try:
-            # Try different column names
-            if 'Close' in row:
-                close_val = row['Close']
-            elif 'close' in row:
-                close_val = row['close']
-            elif 'Adj Close' in row:
-                close_val = row['Adj Close']
-            else:
-                # Get the last numeric column
-                numeric_cols = [col for col in row.index if pd.api.types.is_numeric_dtype(type(row[col]))]
-                close_val = row[numeric_cols[-1]] if numeric_cols else None
-            
-            if close_val is not None:
-                # Handle Series vs scalar
-                if hasattr(close_val, 'iloc'):
-                    close_val = close_val.iloc[0]
-                
-                data_list.append({
-                    "date": date.strftime('%Y-%m-%d'),
-                    "close": round(float(close_val), 2)
-                })
-        except Exception as e:
-            print(f"Error processing row: {e}")
-            continue
-    
-    return data_list
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type((Exception, ConnectionError, TimeoutError)),
-    before_sleep=lambda retry_state: print(f"Retrying yfinance request... Attempt {retry_state.attempt_number}")
-)
-def safe_yf_download(symbol, start, interval, session):
-    """Safe download with retry logic"""
-    time.sleep(random.uniform(1, 3))
-    return yf.download(symbol, start=start, interval=interval, session=session)
+    return {
+        'support': round(support, 2),
+        'resistance': round(resistance, 2),
+        'distance_to_resistance_pct': distance_to_resistance,
+        'distance_to_support_pct': distance_to_support,
+        'closest_level': "Resistance" if distance_to_resistance < distance_to_support else "Support"
+    }
 
 # ==================== ENDPOINTS ====================
 
 @app.route('/get-price', methods=['GET'])
 def get_price():
     symbol = request.args.get('symbol')
-    
     if not symbol:
         return jsonify({"error": "Symbol parameter is required"}), 400
     
     try:
-        price = get_price_safe(symbol)
+        ticker = yf.Ticker(get_api_symbol(symbol), session=session)
+        price = ticker.fast_info.get('last_price', 0)
         return jsonify({
             "symbol": symbol,
-            "price": price,
-            "source": "multi-source"  # Indicates hybrid approach
+            "price": round(price, 2),
+            "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
-        print(f"Error fetching price for {symbol}: {str(e)}")
-        return jsonify({"error": str(e), "symbol": symbol}), 500
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/get-historical-data', methods=['GET'])
 def get_historical_data():
     symbol = request.args.get('symbol')
-    
     if not symbol:
         return jsonify({"error": "Symbol parameter is required"}), 400
     
     try:
-        # Rate limiting check
-        rate_limit_key = f"rate_limit_{symbol}"
-        rate_ref = db.collection('rate_limits').document(rate_limit_key)
-        rate_doc = rate_ref.get()
-        
-        if rate_doc.exists:
-            last_call = datetime.fromisoformat(rate_doc.to_dict()['last_call'])
-            if datetime.now() - last_call < timedelta(minutes=5):
-                return jsonify({
-                    "status": "rate_limited", 
-                    "message": "Please wait 5 minutes before syncing this symbol again"
-                }), 429
-        
-        # Update rate limit timestamp
-        rate_ref.set({'last_call': datetime.now().isoformat()})
-        
         api_symbol = get_api_symbol(symbol)
         asset_ref = db.collection('historical_data').document(api_symbol)
         doc = asset_ref.get()
-
-        start_sync = "2013-01-01"
-        existing_daily = doc.to_dict().get('daily', []) if doc.exists else []
-        existing_monthly = doc.to_dict().get('monthly', []) if doc.exists else []
         
-        if existing_daily:
-            start_sync = (datetime.strptime(existing_daily[-1]['date'], '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+        existing_daily = doc.to_dict().get('daily', []) if doc.exists else []
         
         # Check if already up to date (within 1 day)
         if existing_daily:
@@ -335,141 +176,206 @@ def get_historical_data():
                     "message": "Data is already up to date",
                     "count": len(existing_daily)
                 })
-
-        try:
-            # First try Alpha Vantage for historical data if available
-            new_data_daily = None
-            if ALPHA_VANTAGE_API_KEY:
-                print(f"Trying Alpha Vantage for {symbol}...")
-                new_data_daily = get_alpha_vantage_historical(symbol, start_sync)
-            
-            # If Alpha Vantage fails or not available, use yfinance
-            if not new_data_daily:
-                print(f"Using yfinance for {symbol}...")
-                new_d = safe_yf_download(api_symbol, start=start_sync, interval="1d", session=session)
-                time.sleep(random.uniform(2, 4))
-                new_m = safe_yf_download(api_symbol, start=start_sync, interval="1mo", session=session)
-                
-                new_data_daily = df_to_list(new_d)
-                new_data_monthly = df_to_list(new_m)
-            else:
-                # For Alpha Vantage, we only get daily data
-                # Create monthly data by sampling (every 30 days)
-                new_data_monthly = []
-                for i, item in enumerate(new_data_daily):
-                    if i % 30 == 0:
-                        new_data_monthly.append(item)
-            
-            updated_daily = existing_daily + new_data_daily
-            updated_monthly = existing_monthly + new_data_monthly
-
-            # Deduplicate by date
-            daily_dict = {item['date']: item for item in updated_daily}
-            monthly_dict = {item['date']: item for item in updated_monthly}
-            
-            updated_daily = list(daily_dict.values())
-            updated_monthly = list(monthly_dict.values())
-            
-            # Sort by date
-            updated_daily.sort(key=lambda x: x['date'])
-            updated_monthly.sort(key=lambda x: x['date'])
-
-            asset_ref.set({
-                "daily": updated_daily[-1000:],
-                "monthly": updated_monthly[-120:],
-                "last_updated": datetime.now().isoformat(),
-                "data_source": "alpha_vantage" if ALPHA_VANTAGE_API_KEY and new_data_daily else "yfinance"
-            }, merge=True)
-            
-            return jsonify({
-                "status": "synced", 
-                "count": len(updated_daily),
-                "new_points": len(updated_daily) - len(existing_daily),
-                "source": "alpha_vantage" if ALPHA_VANTAGE_API_KEY and new_data_daily else "yfinance"
+        
+        # Fetch new data
+        ticker = yf.Ticker(api_symbol, session=session)
+        hist = ticker.history(period="1mo", interval="1d")
+        
+        new_data = []
+        for date, row in hist.iterrows():
+            new_data.append({
+                "date": date.strftime('%Y-%m-%d'),
+                "close": round(float(row['Close']), 2)
             })
-            
-        except Exception as e:  # Changed from YahooFinanceException
-            if "rate limit" in str(e).lower() or "too many requests" in str(e).lower():
-                return jsonify({
-                    "error": "Data source rate limit exceeded",
-                    "message": "Please try again in 30 minutes",
-                    "retry_after": 1800
-                }), 429
-            else:
-                raise e
-            
+        
+        # Update Firebase
+        updated_daily = existing_daily + new_data
+        # Deduplicate
+        daily_dict = {item['date']: item for item in updated_daily}
+        updated_daily = list(daily_dict.values())
+        updated_daily.sort(key=lambda x: x['date'])
+        
+        asset_ref.set({
+            "daily": updated_daily[-1000:],
+            "last_updated": datetime.now().isoformat()
+        }, merge=True)
+        
+        return jsonify({
+            "status": "synced", 
+            "count": len(updated_daily),
+            "new_points": len(new_data)
+        })
+        
     except Exception as e:
-        print(f"Error in get-historical-data for {symbol}: {str(e)}")
+        print(f"Error in get-historical-data: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/get-ai-insight', methods=['GET'])
 def get_ai_insight():
     symbol = request.args.get('symbol')
-    # Force the interval to only be 'daily' or 'monthly' to match Firebase keys
-    raw_interval = request.args.get('interval') or 'daily'
-    interval = 'daily' if 'daily' in raw_interval.lower() or '1d' in raw_interval.lower() else 'monthly'
+    interval = request.args.get('interval', 'daily')
+    
+    # Force interval to daily/monthly
+    if 'monthly' in interval.lower() or '1mo' in interval.lower():
+        interval_type = 'monthly'
+        window_size = 48  # 4 years
+    else:
+        interval_type = 'daily'
+        window_size = 126  # 6 months
     
     api_symbol = get_api_symbol(symbol)
-
+    
     try:
+        # Get data from Firebase
         asset_doc = db.collection('historical_data').document(api_symbol).get()
-        if not asset_doc.exists: 
+        if not asset_doc.exists:
             return jsonify({"error": "No data found. Sync first."}), 404
         
-        full_data = asset_doc.to_dict().get(interval, [])
-        if not full_data or len(full_data) < 20: # Need at least 20 points for MA20
-            return jsonify({"error": f"Insufficient {interval} data. Please wait for sync to complete."}), 404
-            
+        full_data = asset_doc.to_dict().get('daily', [])
+        if not full_data or len(full_data) < window_size:
+            return jsonify({"error": f"Insufficient data. Need at least {window_size} days."}), 404
+        
         df = pd.DataFrame(full_data)
-                
-        # FINAL SAFETY: Ensure the 'close' column exists
-        if 'close' not in df.columns:
-             return jsonify({"error": "Data format error: 'close' column missing"}), 500
         
-        # Sampling Logic
-        if interval == 'daily':
-            df_window = df.tail(126).copy() # 6 months
-            df_sampled = df_window.iloc[::4].tail(30) 
-        else:
-            df_window = df.tail(48).copy() # 4 years
-            df_sampled = df_window
-
-        # Technical Indicators
-        df_window['MA20'] = df_window['close'].rolling(window=20).mean()
-        curr_ma = round(float(df_window['MA20'].iloc[-1]), 2)
+        # Ensure we have enough data
+        if len(df) < window_size:
+            return jsonify({"error": "Not enough historical data"}), 404
         
-        # Fetch News (with session) - only if yfinance available
-        news = []
+        # Get analysis window
+        df_window = df.tail(window_size).copy()
+        
+        # Calculate technical indicators
+        ma_data = calculate_moving_averages(df_window)
+        fib_data = calculate_fibonacci_retracement(df_window)
+        sr_data = analyze_support_resistance(df_window)
+        
+        # Get recent news
+        news_titles = []
+        news_sentiment = "neutral"
         try:
-            news = [n['title'] for n in yf.Ticker(api_symbol, session=session).news[:5]]
+            news = yf.Ticker(api_symbol, session=session).news[:10]
+            news_titles = [n['title'] for n in news if 'title' in n]
+            
+            # Simple sentiment analysis
+            positive_words = ['bullish', 'gain', 'rise', 'surge', 'rally', 'positive', 'strong']
+            negative_words = ['bearish', 'drop', 'fall', 'plunge', 'decline', 'negative', 'weak']
+            
+            positive_count = sum(1 for title in news_titles 
+                                for word in positive_words if word.lower() in title.lower())
+            negative_count = sum(1 for title in news_titles 
+                                for word in negative_words if word.lower() in title.lower())
+            
+            if positive_count > negative_count:
+                news_sentiment = "positive"
+            elif negative_count > positive_count:
+                news_sentiment = "negative"
         except:
-            news = ["News data temporarily unavailable"]
-
+            news_titles = ["No recent news available"]
+        
+        # Prepare data for AI
+        analysis_data = {
+            "symbol": symbol,
+            "current_price": round(df_window['close'].iloc[-1], 2),
+            "moving_averages": ma_data,
+            "fibonacci": fib_data,
+            "support_resistance": sr_data,
+            "news_sentiment": news_sentiment,
+            "recent_news": news_titles[:5],
+            "data_sample": df_window[['date', 'close']].tail(30).to_dict('records')
+        }
+        
+        # Create prompt for AI
+        prompt = f"""
+        Analyze {symbol} ({interval_type} data) with the following information:
+        
+        Current Price: ${analysis_data['current_price']}
+        
+        MOVING AVERAGES:
+        - MA20: ${ma_data.get('MA20', 'N/A')}
+        - MA50: ${ma_data.get('MA50', 'N/A')}
+        - MA200: ${ma_data.get('MA200', 'N/A')}
+        - Price is currently {ma_data.get('price_vs_ma20', 'N/A')} the 20-day MA
+        - Trend: {ma_data.get('ma_trend', 'N/A')}
+        
+        FIBONACCI RETRACEMENT (based on last 20 days):
+        - Swing High: ${fib_data['levels']['swing_high'] if fib_data else 'N/A'}
+        - Swing Low: ${fib_data['levels']['swing_low'] if fib_data else 'N/A'}
+        - Current Zone: {fib_data['current_zone'] if fib_data else 'N/A'}
+        - Distance from High: {fib_data['distance_from_high'] if fib_data else 'N/A'}%
+        - Distance from Low: {fib_data['distance_from_low'] if fib_data else 'N/A'}%
+        
+        SUPPORT & RESISTANCE:
+        - Support: ${sr_data.get('support', 'N/A')}
+        - Resistance: ${sr_data.get('resistance', 'N/A')}
+        - Closest to: {sr_data.get('closest_level', 'N/A')}
+        
+        NEWS SENTIMENT: {news_sentiment.upper()}
+        
+        RECENT NEWS HEADLINES:
+        {chr(10).join(news_titles[:5])}
+        
+        Based on ALL the above technical indicators and news sentiment, provide:
+        1. Overall trend assessment
+        2. Key patterns observed
+        3. Fibonacci interpretation
+        4. Moving average analysis
+        5. News impact analysis
+        6. Risk assessment
+        7. Final verdict and recommendation
+        
+        IMPORTANT: Respond in valid JSON format with these exact fields:
+        - trend: (string) Overall market trend
+        - patterns: (array of strings) Key technical patterns
+        - fibonacci_interpretation: (string) Analysis of Fibonacci levels
+        - ma_analysis: (string) Moving average analysis
+        - news_analysis: (string) News sentiment impact
+        - risk_level: (string) Low/Medium/High
+        - verdict: (string) Detailed analysis conclusion
+        - suggestion: (string) BUY/HOLD/SELL
+        - confidence_score: (number 0-100)
+        - recommended_action: (string) Specific action to take
+        """
+        
+        # Get AI response
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are a senior analyst. Respond ONLY in valid JSON. "
-                            "IMPORTANT: All values (trend, verdict, suggestion) MUST be simple STRINGS. "
-                            "DO NOT use objects for these values. "
-                            "Example: 'trend': 'Bullish Accumulation', not 'trend': {'action': 'bullish'}"
+                    "content": "You are a senior technical analyst. Respond ONLY in valid JSON format with the exact fields requested. Provide specific, actionable insights based on all technical indicators combined."
                 },
-                {"role": "user", "content": f"Analyze {api_symbol} {interval} data.\nCSV Data:\n{df_sampled.to_csv()}\nIndicators: MA20 is {curr_ma}.\nNews: {news}"}
+                {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"}
         )
-        return jsonify(json.loads(response.choices[0].message.content))
+        
+        ai_response = json.loads(response.choices[0].message.content)
+        
+        # Combine AI response with technical data
+        result = {
+            **ai_response,
+            "technical_data": {
+                "current_price": analysis_data['current_price'],
+                "moving_averages": ma_data,
+                "fibonacci": fib_data,
+                "support_resistance": sr_data,
+                "news_sentiment": news_sentiment,
+                "recent_news": news_titles[:5],
+                "analysis_date": datetime.now().isoformat()
+            }
+        }
+        
+        return jsonify(result)
+        
     except Exception as e:
+        print(f"Error in get-ai-insight: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
     return jsonify({
         "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "alpha_vantage_available": bool(ALPHA_VANTAGE_API_KEY)
+        "timestamp": datetime.now().isoformat()
     })
 
 if __name__ == '__main__':
