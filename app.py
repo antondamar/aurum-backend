@@ -29,7 +29,7 @@ def get_price():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- NEW OHLC DATA ENDPOINT ---
+
 @app.route('/get-historical-data', methods=['GET'])
 def get_historical_data():
     symbol = request.args.get('symbol')
@@ -66,47 +66,59 @@ def get_historical_data():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    
+
 @app.route('/get-ai-insight', methods=['GET'])
 def get_ai_insight():
     symbol = request.args.get('symbol')
+    timeframe = request.args.get('timeframe', '1mo')
+    interval = request.args.get('interval', '1d')
+    
     if not symbol:
         return jsonify({"error": "Symbol is required"}), 400
     
-    # yfinance often requires -USD for crypto
-    api_symbol = f"{symbol}-USD" if symbol in ['BTC', 'ETH', 'SOL'] else symbol
+    # 1. Improved symbol handling for yfinance
+    api_symbol = symbol
+    if symbol in ['BTC', 'ETH', 'SOL'] and not symbol.endswith('-USD'):
+        api_symbol = f"{symbol}-USD"
+    elif not symbol.endswith('.JK') and any(s in symbol for s in ['BBCA', 'TLKM', 'ASII']):
+        api_symbol = f"{symbol}.JK"
 
     try:
         ticker = yf.Ticker(api_symbol)
-        df = ticker.history(period="1mo")
+        # 2. Add a timeout to history fetch to prevent hanging
+        df = ticker.history(period=timeframe, interval=interval)
         
         if df.empty:
-            return jsonify({"error": f"No data found for {api_symbol}"}), 404
+            return jsonify({"error": f"Yahoo Finance returned no data for {api_symbol}. Try a different timeframe."}), 404
         
-        data_summary = df.tail(30).to_csv(columns=['Close', 'High', 'Low'])
+        # 3. Use standard columns (yfinance columns are Title Case)
+        # Check if columns exist before using them to avoid KeyError
+        cols = [c for c in ['Close', 'High', 'Low', 'Volume'] if c in df.columns]
+        data_summary = df.tail(30).to_csv(columns=cols)
 
+        # 4. OpenAI Call
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are a senior financial analyst. ALWAYS respond in valid JSON format." # "JSON" keyword added here
+                    "content": "You are a senior financial analyst. Respond ONLY in valid JSON format." 
                 },
                 {
                     "role": "user", 
-                    "content": f"Analyze this 30-day OHLC data for {api_symbol} and return a JSON object with keys 'trend', 'patterns', 'sentiment_score', 'verdict', and 'suggestion':\n{data_summary}"
+                    "content": f"Analyze this OHLC data for {api_symbol} and return a JSON object with keys 'trend', 'patterns', 'sentiment_score', 'verdict', and 'suggestion':\n{data_summary}"
                 }
             ],
             response_format={ "type": "json_object" }
         )
         
-        # Parse the string into a dictionary so jsonify can handle it correctly
         ai_data = json.loads(response.choices[0].message.content)
         return jsonify(ai_data)
 
     except Exception as e:
-        print(f"Error: {str(e)}") # This will show up in your Render logs
-        return jsonify({"error": str(e)}), 500
+        # This will print the EXACT error (e.g., 'insufficient_quota') in Render logs
+        print(f"CRITICAL ERROR: {str(e)}") 
+        return jsonify({"error": f"AI Engine Error: {str(e)}"}), 500 
 
 if __name__ == '__main__':
     app.run(port=5000)
