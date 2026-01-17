@@ -65,9 +65,29 @@ def get_historical_data():
         # Fetch Monthly
         new_df_m = yf.download(api_symbol, start=start_sync, interval="1mo")
 
+        # Updated helper inside get_historical_data
         def df_to_list(df):
-            return [{"date": d.strftime('%Y-%m-%d'), "close": round(float(r['Close']), 2)} 
-                    for d, r in df.iterrows()] if not df.empty else []
+            if df.empty:
+                return []
+            
+            # Ensure we are dealing with a standard DataFrame and fix the float conversion
+            data_list = []
+            for d, r in df.iterrows():
+                try:
+                    # Using .item() or float(value) safely
+                    close_val = r['Close']
+                    # If it's a series/array, get the first element
+                    if hasattr(close_val, "__len__"):
+                        close_val = close_val[0]
+                    
+                    data_list.append({
+                        "date": d.strftime('%Y-%m-%d'),
+                        "close": round(float(close_val), 2)
+                    })
+                except Exception as e:
+                    print(f"Row skip error: {e}")
+                    continue
+            return data_list
 
         updated_daily = existing_daily + df_to_list(new_df_d)
         updated_monthly = existing_monthly + df_to_list(new_df_m)
