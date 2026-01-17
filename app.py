@@ -405,7 +405,10 @@ def get_historical_data():
 @app.route('/get-ai-insight', methods=['GET'])
 def get_ai_insight():
     symbol = request.args.get('symbol')
-    interval = request.args.get('interval') or request.args.get('timeframe', 'daily')
+    # Force the interval to only be 'daily' or 'monthly' to match Firebase keys
+    raw_interval = request.args.get('interval') or 'daily'
+    interval = 'daily' if 'daily' in raw_interval.lower() or '1d' in raw_interval.lower() else 'monthly'
+    
     api_symbol = get_api_symbol(symbol)
 
     try:
@@ -414,7 +417,14 @@ def get_ai_insight():
             return jsonify({"error": "No data found. Sync first."}), 404
         
         full_data = asset_doc.to_dict().get(interval, [])
+        if not full_data or len(full_data) < 20: # Need at least 20 points for MA20
+            return jsonify({"error": f"Insufficient {interval} data. Please wait for sync to complete."}), 404
+            
         df = pd.DataFrame(full_data)
+                
+        # FINAL SAFETY: Ensure the 'close' column exists
+        if 'close' not in df.columns:
+             return jsonify({"error": "Data format error: 'close' column missing"}), 500
         
         # Sampling Logic
         if interval == 'daily':
@@ -438,7 +448,13 @@ def get_ai_insight():
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a senior analyst. Respond ONLY in valid JSON. Fields: trend, patterns (array), sentiment_score (0-100), verdict, suggestion (BUY/HOLD/SELL)."},
+                {
+                    "role": "system", 
+                    "content": "You are a senior analyst. Respond ONLY in valid JSON. "
+                            "IMPORTANT: All values (trend, verdict, suggestion) MUST be simple STRINGS. "
+                            "DO NOT use objects for these values. "
+                            "Example: 'trend': 'Bullish Accumulation', not 'trend': {'action': 'bullish'}"
+                },
                 {"role": "user", "content": f"Analyze {api_symbol} {interval} data.\nCSV Data:\n{df_sampled.to_csv()}\nIndicators: MA20 is {curr_ma}.\nNews: {news}"}
             ],
             response_format={"type": "json_object"}
