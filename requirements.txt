@@ -5,3 +5,5 @@ openai
 gunicorn
 pandas
 firebase-admin
+tenacity
+requests
