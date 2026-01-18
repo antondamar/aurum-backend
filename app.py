@@ -227,123 +227,62 @@ def get_yfinance_historical(symbol: str, period: str = "2y") -> Optional[pd.Data
 # ==================== SYNC FUNCTION ====================
 
 def sync_historical_data(symbol: str) -> Dict:
-    """Sync historical data with safety checks"""
+    """Smart sync that appends new data to existing history."""
     try:
-        # Check if we already have recent data in Firebase first
-        api_symbol = get_api_symbol(symbol)
-        existing_doc = db.collection('historical_data').document(api_symbol).get()
-        
-        if existing_doc.exists:
-            data = existing_doc.to_dict()
-            last_synced = datetime.fromisoformat(data.get('last_synced'))
-            # If synced within the last 12 hours, don't hit the API
-            if datetime.now() - last_synced < timedelta(hours=12):
-                return {"success": True, "source": "firebase_cache", "data_points": len(data.get('daily', []))}
-
-        # If we must fetch, try Alpha Vantage
-        df = get_alpha_vantage_historical(symbol, "2y")
-        source = "alpha_vantage"
-        
-        if df is None or df.empty:
-            df = get_yfinance_historical(symbol, "2y")
-            source = "yfinance"
-        
-        if df is None or df.empty:
-            # IMPORTANT: Do NOT call create_mock_historical_data here. 
-            # It's better to fail than to overwrite BTC with $100 fake data.
-            return {"success": False, "error": "API Rate Limit reached. Using cached data if available."}
-        
-        # Prepare data for Firebase
-        new_data = []
-        for _, row in df.iterrows():
-            new_data.append({
-                "date": row['date'].strftime('%Y-%m-%d') if hasattr(row['date'], 'strftime') else str(row['date']),
-                "open": float(round(row['open'], 2)),
-                "high": float(round(row['high'], 2)),
-                "low": float(round(row['low'], 2)),
-                "close": float(round(row['close'], 2)),
-                "volume": int(row['volume']) if 'volume' in row else 0
-            })
-        
-        # Update Firebase
         api_symbol = get_api_symbol(symbol)
         asset_ref = db.collection('historical_data').document(api_symbol)
-        monthly_data = aggregate_to_monthly(new_data)
+        doc = asset_ref.get()
+        
+        existing_daily = []
+        if doc.exists:
+            data = doc.to_dict()
+            existing_daily = data.get('daily', [])
+            last_synced = datetime.fromisoformat(data.get('last_synced'))
+            # 24-HOUR TIMER: Only sync if it's been a day
+            if datetime.now() - last_synced < timedelta(hours=24):
+                return {"success": True, "source": "firebase_cache", "message": "Using cached 24h data"}
+
+        # FETCH ONLY RECENT DATA (1 Month) TO APPEND
+        # This prevents re-downloading 10 years every time
+        new_df = get_alpha_vantage_historical(symbol, "1mo")
+        if new_df is None or new_df.empty:
+            new_df = get_yfinance_historical(symbol, "1mo")
+            
+        if new_df is None or new_df.empty:
+            return create_mock_historical_data(symbol)
+
+        # CONVERT TO LIST OF DICTS
+        new_points = new_df.to_dict('records')
+        for p in new_points:
+            p['date'] = p['date'].strftime('%Y-%m-%d') if not isinstance(p['date'], str) else p['date']
+
+        # SMART MERGE: Combine, Sort, and Drop Duplicates
+        all_data_df = pd.concat([pd.DataFrame(existing_daily), pd.DataFrame(new_points)])
+        all_data_df = all_data_df.drop_duplicates(subset=['date']).sort_values('date')
+        
+        final_daily = all_data_df.to_dict('records')
+        monthly_data = aggregate_to_monthly(final_daily)
+
         asset_ref.set({
-            "daily": new_data,
+            "daily": final_daily,
             "monthly": monthly_data,
             "symbol": symbol,
             "last_synced": datetime.now().isoformat(),
-            "data_points": len(new_data),
-            "data_source": source
+            "data_points": len(final_daily),
+            "data_source": "hybrid_merge"
         }, merge=False)
-        
-        print(f"Synced {len(new_data)} days of data for {symbol} from {source}")
-        
-        return {
-            "success": True,
-            "data_points": len(new_data),
-            "source": source,
-            "message": f"Synced {len(new_data)} days of data for {symbol} from {source}"
-        }
+
+        return {"success": True, "message": f"Appended new data to {symbol}"}
         
     except Exception as e:
-        print(f"Sync error for {symbol}: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "source": "error"
-        }
-
+        return {"success": False, "error": str(e)}
 
 def create_mock_historical_data(symbol: str) -> Dict:
-    """Create mock historical data when APIs fail"""
-    print(f"Creating mock data for {symbol}")
-    
-    # Generate 500 days of mock data
-    dates = pd.date_range(end=datetime.now(), periods=500, freq='D')
-    base_price = 100.0 if symbol == 'BTC' else 50.0
-    
-    new_data = []
-    for i, date in enumerate(dates):
-        trend = 1 + (i * 0.001)  # Slight upward trend
-        volatility = np.random.normal(0, 0.02)
-        
-        close = base_price * trend * (1 + volatility)
-        open_price = close * (1 + np.random.normal(0, 0.01))
-        high = max(open_price, close) * (1 + abs(np.random.normal(0, 0.015)))
-        low = min(open_price, close) * (1 - abs(np.random.normal(0, 0.015)))
-        
-        new_data.append({
-            "date": date.strftime('%Y-%m-%d'),
-            "open": round(float(open_price), 2),
-            "high": round(float(high), 2),
-            "low": round(float(low), 2),
-            "close": round(float(close), 2),
-            "volume": np.random.randint(1000000, 10000000)
-        })
-    
-    # Store mock data in Firebase
-    api_symbol = get_api_symbol(symbol)
-    asset_ref = db.collection('historical_data').document(api_symbol)
-    monthly_data = aggregate_to_monthly(new_data)
-    
-    asset_ref.set({
-        "daily": new_data,
-        "monthly": monthly_data,
-        "symbol": symbol,
-        "last_synced": datetime.now().isoformat(),
-        "data_points": len(new_data),
-        "data_source": "mock_data"
-    }, merge=False)
-    
-    print(f"Created {len(new_data)} days of mock data for {symbol}")
-    
+    """Returns an error instead of fake data to prevent price inaccuracy."""
     return {
-        "success": True,
-        "data_points": len(new_data),
-        "source": "mock_data",
-        "message": f"Created {len(new_data)} days of mock data for {symbol}"
+        "success": False, 
+        "error": "API Rate Limit reached", 
+        "message": f"Real-time data for {symbol} is currently unavailable. Please try again later."
     }
 
 # ==================== TECHNICAL ANALYSIS FUNCTIONS ====================
