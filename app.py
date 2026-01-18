@@ -1014,106 +1014,41 @@ def health_check():
         "alpha_vantage_key_set": bool(ALPHA_VANTAGE_API_KEY)
     })
 
-# ==================== LOCAL SYNC ENDPOINT ====================
-
-@app.route('/local-sync', methods=['POST'])
-def local_sync():
-    """
-    Endpoint for manual sync from your laptop.
-    This should be called from your local machine to populate Firebase.
-    """
-    # Add simple authentication (you can improve this)
-    auth_key = request.headers.get('X-Auth-Key')
-    if auth_key != os.getenv('LOCAL_SYNC_KEY', 'default-sync-key'):
-        return jsonify({"error": "Unauthorized"}), 401
-    
-    data = request.get_json()
-    symbol = data.get('symbol')
-    historical_data = data.get('data', [])
-    
-    if not symbol or not historical_data:
-        return jsonify({"error": "Symbol and data are required"}), 400
-    
+# ==================== DIRECT UPDATE ENDPOINT ====================
+@app.route('/direct-update', methods=['POST'])
+def direct_update():
+    """Simple endpoint to accept data from local sync"""
     try:
+        data = request.get_json()
+        symbol = data.get('symbol')
+        historical_data = data.get('data', [])
+        
+        if not symbol or not historical_data:
+            return jsonify({"error": "Missing symbol or data"}), 400
+        
+        # Store in Firebase
         api_symbol = get_api_symbol(symbol)
         asset_ref = db.collection('historical_data').document(api_symbol)
         
-        # Store the data
         asset_ref.set({
             "daily": historical_data,
             "symbol": symbol,
             "last_synced": datetime.now().isoformat(),
             "data_points": len(historical_data),
-            "data_source": "local_sync",
-            "synced_from": "local_machine"
+            "data_source": "local_sync"
         }, merge=False)
         
         return jsonify({
-            "status": "synced",
+            "status": "success",
             "symbol": symbol,
             "data_points": len(historical_data),
-            "message": f"Locally synced {len(historical_data)} days of data for {symbol}"
+            "message": f"Updated {len(historical_data)} days of data"
         })
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ==================== LOCAL SYNC ENDPOINT ====================
-
-@app.route('/local-sync', methods=['POST'])
-def local_sync():
-    """
-    Endpoint for manual sync from your laptop.
-    This should be called from your local machine to populate Firebase.
-    """
-    # Add simple authentication
-    auth_key = request.headers.get('X-Auth-Key')
-    expected_key = os.getenv('LOCAL_SYNC_KEY')
-    
-    if not expected_key:
-        return jsonify({"error": "LOCAL_SYNC_KEY not configured on server"}), 500
-    
-    if auth_key != expected_key:
-        return jsonify({"error": "Unauthorized"}), 401
-    
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "No JSON data provided"}), 400
-    
-    symbol = data.get('symbol')
-    historical_data = data.get('data', [])
-    
-    if not symbol:
-        return jsonify({"error": "Symbol is required"}), 400
-    
-    if not historical_data:
-        return jsonify({"error": "Historical data array is required"}), 400
-    
-    try:
-        api_symbol = get_api_symbol(symbol)
-        asset_ref = db.collection('historical_data').document(api_symbol)
-        
-        # Store the data
-        asset_ref.set({
-            "daily": historical_data,
-            "symbol": symbol,
-            "last_synced": datetime.now().isoformat(),
-            "data_points": len(historical_data),
-            "data_source": "local_sync",
-            "synced_from": "local_machine"
-        }, merge=False)
-        
-        return jsonify({
-            "status": "synced",
-            "symbol": symbol,
-            "api_symbol": api_symbol,
-            "data_points": len(historical_data),
-            "message": f"Locally synced {len(historical_data)} days of data for {symbol}"
-        })
-        
-    except Exception as e:
-        print(f"Local sync error: {e}")
-        return jsonify({"error": str(e)}), 500
+# ==================== MAIN ====================
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
