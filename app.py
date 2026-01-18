@@ -104,95 +104,6 @@ def get_alpha_vantage_historical(symbol: str, period: str = "2y") -> Optional[pd
         print(f"Alpha Vantage historical data error for {symbol}: {e}")
         return None
 
-def get_alpha_vantage_news(symbol: str) -> List[Dict]:
-    """Get news from Alpha Vantage with better error handling"""
-    if not ALPHA_VANTAGE_API_KEY:
-        print("⚠️ No Alpha Vantage API key")
-        return []
-    
-    try:
-        # Clean symbol for Alpha Vantage
-        clean_symbol = symbol.upper()
-        if clean_symbol.endswith('.JK'):
-            clean_symbol = clean_symbol.replace('.JK', '')
-        if clean_symbol.endswith('-USD'):
-            clean_symbol = clean_symbol.replace('-USD', '')
-        
-        print(f"📰 Fetching news for {clean_symbol}...")
-        
-        # Alpha Vantage news endpoint
-        url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={clean_symbol}&apikey={ALPHA_VANTAGE_API_KEY}&limit=5"
-        
-        response = session.get(url, timeout=15)
-        
-        # Check for rate limiting
-        if 'Note' in response.text or 'Information' in response.text:
-            print(f"⚠️ Alpha Vantage rate limited for {symbol}")
-            return []
-        
-        data = response.json()
-        
-        # Debug: print raw response
-        print(f"News API response keys: {list(data.keys()) if isinstance(data, dict) else 'not dict'}")
-        
-        news_items = []
-        if 'feed' in data and data['feed']:
-            for item in data['feed'][:3]:  # Get top 3 news
-                # Extract ticker sentiments
-                ticker_sentiments = item.get('ticker_sentiment', [])
-                symbol_sentiment = 0
-                
-                # Find sentiment for our symbol
-                for ticker_info in ticker_sentiments:
-                    if ticker_info.get('ticker') == clean_symbol:
-                        symbol_sentiment = float(ticker_info.get('ticker_sentiment_score', 0))
-                        break
-                
-                news_items.append({
-                    'title': item.get('title', ''),
-                    'summary': item.get('summary', ''),
-                    'source': item.get('source', ''),
-                    'time_published': item.get('time_published', ''),
-                    'url': item.get('url', ''),
-                    'sentiment_score': symbol_sentiment,
-                    'overall_sentiment': float(item.get('overall_sentiment_score', 0)),
-                    'sentiment_label': item.get('overall_sentiment_label', 'neutral')
-                })
-            
-            print(f"✅ Found {len(news_items)} news items for {symbol}")
-        else:
-            print(f"⚠️ No news found for {symbol}")
-            # Return mock news for testing
-            news_items = get_mock_news(symbol)
-        
-        return news_items
-        
-    except Exception as e:
-        print(f"❌ Alpha Vantage news error for {symbol}: {e}")
-        # Return mock data as fallback
-        return get_mock_news(symbol)
-
-def get_mock_news(symbol: str) -> List[Dict]:
-    """Provide mock news when API fails"""
-    return [
-        {
-            'title': f'{symbol} shows strong technical patterns',
-            'summary': f'Technical analysis indicates potential breakout for {symbol}',
-            'source': 'Technical Analysis',
-            'time_published': datetime.now().strftime('%Y%m%dT%H%M%S'),
-            'sentiment_score': 0.15,
-            'sentiment_label': 'positive'
-        },
-        {
-            'title': f'Market watching {symbol} closely',
-            'summary': f'Traders are monitoring {symbol} for upcoming trends',
-            'source': 'Market Watch',
-            'time_published': datetime.now().strftime('%Y%m%dT%H%M%S'),
-            'sentiment_score': 0.05,
-            'sentiment_label': 'neutral'
-        }
-    ]
-
 def get_yfinance_historical(symbol: str, period: str = "2y") -> Optional[pd.DataFrame]:
     """Get historical data from yfinance (fallback)"""
     try:
@@ -1004,6 +915,15 @@ def get_ai_insight():
         # 4. Calculate Moving Averages on FULL timeframe (Fixes MA=0 issue)
         ma_data = calculate_moving_averages(df)
 
+        # --- VOLUME LOGIC ---
+        # Get the latest data point from your dataframe
+        latest_point = df.iloc[-1]
+        
+        # User Logic: Monthly uses total month volume, Daily uses daily volume
+        # Since your data is already aggregated in 'data_pool', df['volume'] 
+        # already represents the 'total' for that specific candle.
+        current_volume = float(latest_point['volume'])
+
         # 5. DOWNSAMPLE TO EXACTLY 50 POINTS for AI context
         analysis_df = downsample_to_50_points(df)
         
@@ -1013,12 +933,14 @@ def get_ai_insight():
         patterns = detect_candlestick_patterns(analysis_df, interval) or ["No patterns detected"]
         
         current_price = float(analysis_df['close'].iloc[-1])
+
         
-                # 8. Prepare Technical Summary with Correct Variables
+        # 8. Prepare Technical Summary with Correct Variables
         technical_summary = {
             "symbol": symbol,
             "analysis_type": description,
             "current_price": current_price,
+            "volume": current_volume,
             "price_formatted": format_currency(current_price),
             "data_period": f"{len(analysis_df)} points (downsampled)",
             "data_source": data_dict.get('data_source', 'unknown'),
@@ -1085,15 +1007,19 @@ def get_ai_insight():
         
         PATTERNS DETECTED:
         {chr(10).join([f"- {pattern}" for pattern in patterns])}
+
+        VOLUME: {technical_summary['volume']} ({interval_type} total)
         
         Based on ALL technical indicators above, provide a comprehensive analysis including:
         1. Overall trend assessment with confidence level
         2. Significance of Fibonacci retracement level
         3. Moving average alignment implications (focus on 13, 20, 21, 50, 200 MA)
-        4. Pattern recognition analysis
-        5. Support/resistance breakout potential
-        6. Risk assessment with specific risk factors
-        7. Clear trading recommendation with entry/exit levels
+        4. Based on the Volume data, explicitly decide if market participants are: BUYING, SELLING, or MODERATE.
+        5. Explain if the volume confirms the current price trend (e.g., rising price on rising volume = strong buying).
+        6. Pattern recognition analysis
+        7. Support/resistance breakout potential
+        8. Risk assessment with specific risk factors
+        9. Clear trading recommendation with entry/exit levels
         
         Respond in valid JSON format with these exact fields:
         - trend: (string) Overall market trend with confidence
@@ -1195,58 +1121,51 @@ def direct_update():
 # ==================== LOCAL UPLOAD ENDPOINT ====================
 @app.route('/local-upload', methods=['POST'])
 def local_upload():
-    """Endpoint for laptop to upload data - APPENDS new data"""
     try:
         data = request.get_json()
         symbol = data.get('symbol')
+        interval = data.get('interval', 'daily') # Capture the interval
         new_historical_data = data.get('data', [])
         
         if not symbol or not new_historical_data:
             return jsonify({"error": "Missing symbol or data"}), 400
         
-        # Get existing data from Firebase
         api_symbol = get_api_symbol(symbol)
         asset_ref = db.collection('historical_data').document(api_symbol)
         doc = asset_ref.get()
         
-        existing_data = []
-        if doc.exists:
-            existing_dict = doc.to_dict()
-            existing_data = existing_dict.get('daily', [])
+        # Determine which field to target (daily or monthly)
+        target_field = 'monthly' if interval == 'monthly' else 'daily'
         
-        # Merge: Keep existing, add new unique dates
+        existing_data = []
+        full_doc_data = {}
+        if doc.exists:
+            full_doc_data = doc.to_dict()
+            existing_data = full_doc_data.get(target_field, [])
+        
+        # Merge logic (preserving existing dates)
         existing_dates = {item['date'] for item in existing_data}
         merged_data = existing_data.copy()
         
-        new_items_added = 0
         for new_item in new_historical_data:
             if new_item['date'] not in existing_dates:
                 merged_data.append(new_item)
-                new_items_added += 1
         
-        # Sort by date
         merged_data.sort(key=lambda x: x['date'])
         
-        # Update Firebase
-        asset_ref.set({
-            "daily": merged_data,
+        # IMPORTANT: Update ONLY the target interval without deleting the other
+        full_doc_data.update({
+            target_field: merged_data,
             "symbol": symbol,
             "last_synced": datetime.now().isoformat(),
-            "data_points": len(merged_data),
-            "data_source": f"local_upload (merged, added {new_items_added} new)"
-        }, merge=False)
-        
-        return jsonify({
-            "success": True,
-            "symbol": symbol,
-            "existing_points": len(existing_data),
-            "new_points_added": new_items_added,
-            "total_points": len(merged_data),
-            "message": f"Merged data: {len(existing_data)} existing + {new_items_added} new = {len(merged_data)} total"
+            "data_source": f"local_upload_{interval}"
         })
         
+        asset_ref.set(full_doc_data, merge=False)
+        
+        return jsonify({"success": True, "message": f"Updated {target_field}"})
+        
     except Exception as e:
-        print(f"Upload error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
