@@ -1073,32 +1073,54 @@ def direct_update():
 # ==================== LOCAL UPLOAD ENDPOINT ====================
 @app.route('/local-upload', methods=['POST'])
 def local_upload():
-    """Endpoint for laptop to upload data"""
+    """Endpoint for laptop to upload data - APPENDS new data"""
     try:
         data = request.get_json()
         symbol = data.get('symbol')
-        historical_data = data.get('data', [])
+        new_historical_data = data.get('data', [])
         
-        if not symbol or not historical_data:
+        if not symbol or not new_historical_data:
             return jsonify({"error": "Missing symbol or data"}), 400
         
-        # Store in Firebase
+        # Get existing data from Firebase
         api_symbol = get_api_symbol(symbol)
         asset_ref = db.collection('historical_data').document(api_symbol)
+        doc = asset_ref.get()
         
+        existing_data = []
+        if doc.exists:
+            existing_dict = doc.to_dict()
+            existing_data = existing_dict.get('daily', [])
+        
+        # Merge: Keep existing, add new unique dates
+        existing_dates = {item['date'] for item in existing_data}
+        merged_data = existing_data.copy()
+        
+        new_items_added = 0
+        for new_item in new_historical_data:
+            if new_item['date'] not in existing_dates:
+                merged_data.append(new_item)
+                new_items_added += 1
+        
+        # Sort by date
+        merged_data.sort(key=lambda x: x['date'])
+        
+        # Update Firebase
         asset_ref.set({
-            "daily": historical_data,
+            "daily": merged_data,
             "symbol": symbol,
             "last_synced": datetime.now().isoformat(),
-            "data_points": len(historical_data),
-            "data_source": "local_upload"
+            "data_points": len(merged_data),
+            "data_source": f"local_upload (merged, added {new_items_added} new)"
         }, merge=False)
         
         return jsonify({
             "success": True,
             "symbol": symbol,
-            "data_points": len(historical_data),
-            "message": f"Uploaded {len(historical_data)} days"
+            "existing_points": len(existing_data),
+            "new_points_added": new_items_added,
+            "total_points": len(merged_data),
+            "message": f"Merged data: {len(existing_data)} existing + {new_items_added} new = {len(merged_data)} total"
         })
         
     except Exception as e:
