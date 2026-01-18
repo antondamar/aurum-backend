@@ -846,6 +846,11 @@ def get_ai_insight():
                 days_to_keep = months_to_keep * 30
                 cutoff_date = datetime.now() - timedelta(days=days_to_keep)
                 df = df[df['date'] >= cutoff_date]
+        elif timeframe.endswith('d'):
+            # Handle day-based timeframes (e.g., 15d)
+            days_to_keep = int(timeframe.replace('d', ''))
+            cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+            df = df[df['date'] >= cutoff_date]
         else:
             # Default to 2 years if invalid format
             if interval == 'monthly':
