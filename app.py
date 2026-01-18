@@ -749,79 +749,15 @@ def calculate_support_resistance(df: pd.DataFrame) -> Dict:
             'closest_level': "Calculation error",
             'strength': "Unknown"
         }
-    
-def sync_historical_data(symbol: str) -> Dict:
-    """Sync historical data with Alpha Vantage as primary, yfinance as fallback"""
-    try:
-        print(f"Starting sync for {symbol}")
-        
-        # Get the API symbol inside the function
-        api_symbol = get_api_symbol(symbol)
-        
-        # Try Alpha Vantage first
-        df = get_alpha_vantage_historical(symbol, "2y")
-        source = "alpha_vantage"
-        
-        # If Alpha Vantage fails, try yfinance
-        if df is None or df.empty:
-            print(f"Alpha Vantage failed for {symbol}, trying yfinance...")
-            df = get_yfinance_historical(symbol, "2y")
-            source = "yfinance"
-        
-        # If both fail, return error
-        if df is None or df.empty:
-            return {
-                "success": False,
-                "error": "Could not fetch data from any source",
-                "source": "none"
-            }
-        
-        # Prepare data for Firebase
-        new_data = []
-        for _, row in df.iterrows():
-            new_data.append({
-                "date": row['date'].strftime('%Y-%m-%d') if hasattr(row['date'], 'strftime') else str(row['date']),
-                "open": float(round(row['open'], 2)),
-                "high": float(round(row['high'], 2)),
-                "low": float(round(row['low'], 2)),
-                "close": float(round(row['close'], 2)),
-                "volume": int(row['volume']) if 'volume' in row else 0
-            })
-        
-        # Update Firebase
-        asset_ref = db.collection('historical_data').document(api_symbol)
-        asset_ref.set({
-            "daily": new_data,
-            "symbol": symbol,
-            "last_synced": datetime.now().isoformat(),
-            "data_points": len(new_data),
-            "data_source": source
-        }, merge=False)
-        
-        print(f"Synced {len(new_data)} days of data for {symbol} from {source}")
-        
-        return {
-            "success": True,
-            "data_points": len(new_data),
-            "source": source,
-            "message": f"Synced {len(new_data)} days of data for {symbol} from {source}"
-        }
-        
-    except Exception as e:
-        print(f"Sync error for {symbol}: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "source": "error"
-        }
-    
-def downsample_data(df: pd.DataFrame, target_points: int = 50) -> pd.DataFrame:
-    """Downsample dataframe to exactly target_points using step slicing"""
-    if len(df) <= target_points:
+
+def downsample_to_50_points(df: pd.DataFrame) -> pd.DataFrame:
+    """Always reduces the dataframe to exactly 50 representative points"""
+    if len(df) <= 50:
         return df
-    step = len(df) // target_points
-    # Take every nth row and ensure the most recent point is included
-    downsampled = df.iloc[::step].tail(target_points)
+    # Logic: Total length / 50 = step size
+    step = len(df) // 50
+    # Select every nth row to maintain consistent trend representation
+    downsampled = df.iloc[::step].tail(50) 
     return downsampled
 
 # ==================== ENDPOINTS ====================
@@ -861,45 +797,55 @@ def get_historical_data():
 @app.route('/get-ai-insight', methods=['GET'])
 def get_ai_insight():
     symbol = request.args.get('symbol')
-    if not symbol:
-        return jsonify({"error": "Symbol required"}), 400
-    
     interval = request.args.get('interval', 'daily')
+    timeframe = request.args.get('timeframe', '2y')
+    
     api_symbol = get_api_symbol(symbol)
     
-    # Define variables for the AI Prompt
-    description = "Macro (4Y) Portfolio Strategy" if 'monthly' in interval.lower() else "Swing (6M) Technical Analysis"
-    interval_type = "Monthly" if 'monthly' in interval.lower() else "Daily"
+    # 1. DEFINE MISSING METADATA VARIABLES
+    description = "Macro (4Y) Portfolio Strategy" if interval == 'monthly' else "Swing (6M) Technical Analysis"
+    interval_type = "Monthly" if interval == 'monthly' else "Daily"
     
     try:
-        # 1. Get FULL data from Firebase
+        # 2. Fetch requested timeframe from Firebase or API
         asset_doc = db.collection('historical_data').document(api_symbol).get()
-        if not asset_doc.exists:
-            sync_historical_data(symbol)
-            asset_doc = db.collection('historical_data').document(api_symbol).get()
-            
-        data_dict = asset_doc.to_dict() # FIX: Define data_dict
-        full_data = data_dict.get('daily', [])
-        df = pd.DataFrame(full_data)
-        
-        # 2. Calculate MAs on the HIGH-RESOLUTION data (Full set)
-        ma_data = calculate_moving_averages(df)
-        
-        # 3. Apply the "50 Main Points" rule for the AI analysis
-        if 'monthly' in interval.lower():
-            analysis_df = df.copy()
+        # FIX: Ensure data_dict is defined for the response
+        if asset_doc.exists:
+            data_dict = asset_doc.to_dict()
         else:
-            analysis_df = df.tail(180).copy()
-            
-        analysis_df = downsample_data(analysis_df, 50)
+            sync_result = sync_historical_data(symbol)
+            if not sync_result.get('success'):
+                return jsonify({"error": "Data sync failed", "message": sync_result.get('error')}), 503
+            data_dict = db.collection('historical_data').document(api_symbol).get().to_dict()
         
-        # 4. Calculate other indicators
+        # Determine data pool
+        data_pool = data_dict.get('monthly', []) if interval == 'monthly' else data_dict.get('daily', [])
+        if not data_pool:
+            # Fallback if specific interval list is empty
+            data_pool = data_dict.get('daily', [])
+            
+        df = pd.DataFrame(data_pool)
+        
+        # 3. Filter by timeframe
+        df['date'] = pd.to_datetime(df['date'])
+        years_to_keep = int(timeframe.replace('y', ''))
+        cutoff_date = datetime.now() - timedelta(days=years_to_keep * 365)
+        df = df[df['date'] >= cutoff_date]
+
+        # 4. Calculate Moving Averages on FULL timeframe (Fixes MA=0 issue)
+        ma_data = calculate_moving_averages(df)
+
+        # 5. DOWNSAMPLE TO EXACTLY 50 POINTS for AI context
+        analysis_df = downsample_to_50_points(df)
+        
+        # 6. Perform Technical Analysis on these 50 points
         fib_data = calculate_fibonacci_retracement(analysis_df)
         sr_data = calculate_support_resistance(analysis_df)
-        patterns = detect_candlestick_patterns(analysis_df)
+        # FIX: Define patterns variable
+        patterns = detect_candlestick_patterns(analysis_df) or ["No patterns detected"]
         
-        # 5. Fixed News Fetch
-        news_items = get_alpha_vantage_news(symbol)
+        # 7. Fetch News
+        news_items = get_alpha_vantage_news(symbol) or get_mock_news(symbol)
         news_titles = [item['title'] for item in news_items[:3]]
 
         news_sentiment = "neutral"
@@ -911,13 +857,12 @@ def get_ai_insight():
             if valid_scores:
                 avg_sentiment = sum(valid_scores) / len(valid_scores)
                 sentiment_score = avg_sentiment
-                # Mapping logic... (kept from previous code)
                 if avg_sentiment > 0.15: news_sentiment = "bullish"
                 elif avg_sentiment < -0.15: news_sentiment = "bearish"
         
         current_price = float(analysis_df['close'].iloc[-1])
         
-        # 6. Prepare Technical Summary
+        # 8. Prepare Technical Summary with Correct Variables
         technical_summary = {
             "symbol": symbol,
             "analysis_type": description,
@@ -958,7 +903,6 @@ def get_ai_insight():
                 "source": "Alpha Vantage News Sentiment API"
             }
         }
-        
         # Create comprehensive prompt for AI
         prompt = f"""
         Perform a comprehensive technical analysis for {symbol} based on the following data:
