@@ -690,48 +690,70 @@ def calculate_support_resistance(df: pd.DataFrame) -> Dict:
             'strength': "Unknown"
         }
     
-
-def sync_historical_data(symbol: str, api_symbol: str) -> Dict:
-    """Internal function to sync historical data"""
+def sync_historical_data(symbol: str) -> Dict:
+    """Sync historical data with Alpha Vantage as primary, yfinance as fallback"""
     try:
-        ticker = yf.Ticker(api_symbol, session=session)
+        print(f"Starting sync for {symbol}")
         
-        # For crypto, try to get OHLC data
-        try:
-            hist = ticker.history(period="2y", interval="1d")
-        except:
-            # Fallback to 1 year if 2 years fails
-            hist = ticker.history(period="1y", interval="1d")
+        # Get the API symbol inside the function
+        api_symbol = get_api_symbol(symbol)
         
+        # Try Alpha Vantage first
+        df = get_alpha_vantage_historical(symbol, "2y")
+        source = "alpha_vantage"
+        
+        # If Alpha Vantage fails, try yfinance
+        if df is None or df.empty:
+            print(f"Alpha Vantage failed for {symbol}, trying yfinance...")
+            df = get_yfinance_historical(symbol, "2y")
+            source = "yfinance"
+        
+        # If both fail, return error
+        if df is None or df.empty:
+            return {
+                "success": False,
+                "error": "Could not fetch data from any source",
+                "source": "none"
+            }
+        
+        # Prepare data for Firebase
         new_data = []
-        for date, row in hist.iterrows():
+        for _, row in df.iterrows():
             new_data.append({
-                "date": date.strftime('%Y-%m-%d'),
-                "open": float(round(row['Open'], 2)),
-                "high": float(round(row['High'], 2)),
-                "low": float(round(row['Low'], 2)),
-                "close": float(round(row['Close'], 2)),
-                "volume": int(row['Volume']) if 'Volume' in row else 0
+                "date": row['date'].strftime('%Y-%m-%d') if hasattr(row['date'], 'strftime') else str(row['date']),
+                "open": float(round(row['open'], 2)),
+                "high": float(round(row['high'], 2)),
+                "low": float(round(row['low'], 2)),
+                "close": float(round(row['close'], 2)),
+                "volume": int(row['volume']) if 'volume' in row else 0
             })
         
-        # Update Firebase with new data
+        # Update Firebase
         asset_ref = db.collection('historical_data').document(api_symbol)
         asset_ref.set({
             "daily": new_data,
             "symbol": symbol,
             "last_synced": datetime.now().isoformat(),
-            "data_points": len(new_data)
+            "data_points": len(new_data),
+            "data_source": source
         }, merge=False)
+        
+        print(f"Synced {len(new_data)} days of data for {symbol} from {source}")
         
         return {
             "success": True,
             "data_points": len(new_data),
-            "message": f"Synced {len(new_data)} days of data for {symbol}"
+            "source": source,
+            "message": f"Synced {len(new_data)} days of data for {symbol} from {source}"
         }
         
     except Exception as e:
-        print(f"Sync error: {e}")
-        return {"success": False, "error": str(e)}
+        print(f"Sync error for {symbol}: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "source": "error"
+        }
 
 # ==================== ENDPOINTS ====================
 
