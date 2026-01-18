@@ -232,6 +232,7 @@ def sync_historical_data(symbol: str) -> Dict:
         print(f"Starting sync for {symbol}")
         
         # Try Alpha Vantage first
+        print(f"Trying Alpha Vantage for {symbol}...")
         df = get_alpha_vantage_historical(symbol, "2y")
         source = "alpha_vantage"
         
@@ -243,6 +244,7 @@ def sync_historical_data(symbol: str) -> Dict:
         
         # If both fail, return error
         if df is None or df.empty:
+            print(f"Both Alpha Vantage and yFinance failed for {symbol}")
             return {
                 "success": False,
                 "error": "Could not fetch data from any source",
@@ -943,16 +945,35 @@ def get_ai_insight():
             
         df = pd.DataFrame(data_pool)
         
-        # 3. Filter by timeframe
-        if interval == 'monthly':
-            # For monthly, filter by number of months
-            months_to_keep = int(timeframe.replace('y', '')) * 12
-            df = df.tail(months_to_keep)  # Keep last N months
-        else:
-            # For daily, use your current day-based filtering
+        # 3. Filter by timeframe - handle both 'y' and 'm' formats
+        df['date'] = pd.to_datetime(df['date'])
+        
+        if timeframe.endswith('y'):
+            # Handle year-based timeframes
             years_to_keep = int(timeframe.replace('y', ''))
-            cutoff_date = datetime.now() - timedelta(days=years_to_keep * 365)
-            df = df[df['date'] >= cutoff_date]
+            if interval == 'monthly':
+                months_to_keep = years_to_keep * 12
+                df = df.tail(months_to_keep)
+            else:
+                cutoff_date = datetime.now() - timedelta(days=years_to_keep * 365)
+                df = df[df['date'] >= cutoff_date]
+        elif timeframe.endswith('m'):
+            # Handle month-based timeframes
+            months_to_keep = int(timeframe.replace('m', ''))
+            if interval == 'monthly':
+                df = df.tail(months_to_keep)
+            else:
+                # For daily, convert months to days (approx 30 days/month)
+                days_to_keep = months_to_keep * 30
+                cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+                df = df[df['date'] >= cutoff_date]
+        else:
+            # Default to 2 years if invalid format
+            if interval == 'monthly':
+                df = df.tail(24)  # 2 years * 12 months
+            else:
+                cutoff_date = datetime.now() - timedelta(days=2 * 365)
+                df = df[df['date'] >= cutoff_date]
 
         # 4. Calculate Moving Averages on FULL timeframe (Fixes MA=0 issue)
         ma_data = calculate_moving_averages(df)
