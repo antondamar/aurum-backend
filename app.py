@@ -51,8 +51,61 @@ def format_currency(value: float) -> str:
 
 # ==================== ALPHA VANTAGE FUNCTIONS ====================
 
+def get_alpha_vantage_historical(symbol: str, period: str = "2y") -> Optional[pd.DataFrame]:
+    """Get historical data from Alpha Vantage"""
+    if not ALPHA_VANTAGE_API_KEY:
+        return None
+    
+    try:
+        # Map period to Alpha Vantage output size
+        output_size_map = {
+            "1y": "compact",
+            "2y": "full",
+            "5y": "full",
+            "10y": "full"
+        }
+        
+        output_size = output_size_map.get(period, "full")
+        
+        # Alpha Vantage TIME_SERIES_DAILY endpoint
+        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&outputsize={output_size}&apikey={ALPHA_VANTAGE_API_KEY}"
+        response = session.get(url, timeout=10)
+        data = response.json()
+        
+        if 'Time Series (Daily)' not in data:
+            # Check for error or rate limit
+            if 'Note' in data or 'Information' in data:
+                print(f"Alpha Vantage rate limit or info: {data.get('Note', data.get('Information', 'Unknown'))}")
+                return None
+            print(f"No time series data in response for {symbol}")
+            return None
+        
+        time_series = data['Time Series (Daily)']
+        
+        # Convert to DataFrame
+        records = []
+        for date_str, values in time_series.items():
+            records.append({
+                'date': date_str,
+                'open': float(values['1. open']),
+                'high': float(values['2. high']),
+                'low': float(values['3. low']),
+                'close': float(values['4. close']),
+                'volume': int(float(values['5. volume']))
+            })
+        
+        df = pd.DataFrame(records)
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date')
+        
+        return df
+        
+    except Exception as e:
+        print(f"Alpha Vantage historical data error for {symbol}: {e}")
+        return None
+
 def get_alpha_vantage_news(symbol: str) -> List[Dict]:
-    """Get news from Alpha Vantage"""
+    """Get news and sentiment from Alpha Vantage"""
     if not ALPHA_VANTAGE_API_KEY:
         return []
     
@@ -70,14 +123,111 @@ def get_alpha_vantage_news(symbol: str) -> List[Dict]:
                     'summary': item.get('summary', ''),
                     'source': item.get('source', ''),
                     'time_published': item.get('time_published', ''),
-                    'sentiment_score': item.get('overall_sentiment_score', 0),
-                    'sentiment_label': item.get('overall_sentiment_label', 'neutral')
+                    'sentiment_score': float(item.get('overall_sentiment_score', 0)),
+                    'sentiment_label': item.get('overall_sentiment_label', 'neutral'),
+                    'relevance_score': float(item.get('relevance_score', 0))
                 })
         
         return news_items
     except Exception as e:
         print(f"Alpha Vantage news error: {e}")
         return []
+
+def get_yfinance_historical(symbol: str, period: str = "2y") -> Optional[pd.DataFrame]:
+    """Get historical data from yfinance (fallback)"""
+    try:
+        api_symbol = get_api_symbol(symbol)
+        ticker = yf.Ticker(api_symbol, session=session)
+        
+        # Try multiple periods
+        for p in [period, "1y", "6mo", "3mo", "1mo"]:
+            try:
+                hist = ticker.history(period=p, interval="1d")
+                if not hist.empty:
+                    # Convert to our format
+                    df = pd.DataFrame({
+                        'date': hist.index,
+                        'open': hist['Open'].values,
+                        'high': hist['High'].values,
+                        'low': hist['Low'].values,
+                        'close': hist['Close'].values,
+                        'volume': hist['Volume'].values if 'Volume' in hist.columns else 0
+                    })
+                    return df
+            except Exception as e:
+                print(f"yfinance error for period {p}: {e}")
+                continue
+        
+        return None
+        
+    except Exception as e:
+        print(f"yfinance historical data error for {symbol}: {e}")
+        return None
+
+# ==================== SYNC FUNCTION ====================
+
+def sync_historical_data(symbol: str) -> Dict:
+    """Sync historical data with Alpha Vantage as primary, yfinance as fallback"""
+    try:
+        print(f"Starting sync for {symbol}")
+        
+        # Try Alpha Vantage first
+        df = get_alpha_vantage_historical(symbol, "2y")
+        source = "alpha_vantage"
+        
+        # If Alpha Vantage fails, try yfinance
+        if df is None or df.empty:
+            print(f"Alpha Vantage failed for {symbol}, trying yfinance...")
+            df = get_yfinance_historical(symbol, "2y")
+            source = "yfinance"
+        
+        # If both fail, return error
+        if df is None or df.empty:
+            return {
+                "success": False,
+                "error": "Could not fetch data from any source",
+                "source": "none"
+            }
+        
+        # Prepare data for Firebase
+        new_data = []
+        for _, row in df.iterrows():
+            new_data.append({
+                "date": row['date'].strftime('%Y-%m-%d') if hasattr(row['date'], 'strftime') else str(row['date']),
+                "open": float(round(row['open'], 2)),
+                "high": float(round(row['high'], 2)),
+                "low": float(round(row['low'], 2)),
+                "close": float(round(row['close'], 2)),
+                "volume": int(row['volume']) if 'volume' in row else 0
+            })
+        
+        # Update Firebase
+        api_symbol = get_api_symbol(symbol)
+        asset_ref = db.collection('historical_data').document(api_symbol)
+        asset_ref.set({
+            "daily": new_data,
+            "symbol": symbol,
+            "last_synced": datetime.now().isoformat(),
+            "data_points": len(new_data),
+            "data_source": source
+        }, merge=False)
+        
+        print(f"Synced {len(new_data)} days of data for {symbol} from {source}")
+        
+        return {
+            "success": True,
+            "data_points": len(new_data),
+            "source": source,
+            "message": f"Synced {len(new_data)} days of data for {symbol} from {source}"
+        }
+        
+    except Exception as e:
+        print(f"Sync error for {symbol}: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "source": "error"
+        }
 
 # ==================== TECHNICAL ANALYSIS FUNCTIONS ====================
 
@@ -587,50 +737,31 @@ def sync_historical_data(symbol: str, api_symbol: str) -> Dict:
 
 @app.route('/get-historical-data', methods=['GET'])
 def get_historical_data():
+    """Sync historical data endpoint"""
     symbol = request.args.get('symbol')
     if not symbol:
         return jsonify({"error": "Symbol parameter is required"}), 400
     
     try:
-        api_symbol = get_api_symbol(symbol)
-        ticker = yf.Ticker(api_symbol, session=session)
+        # Use the new sync function
+        sync_result = sync_historical_data(symbol)
         
-        # 1. Attempt download
-        hist = ticker.history(period="2y", interval="1d")
-        
-        # 2. CRITICAL CHECK: If hist is empty, Yahoo has blocked the request
-        if hist.empty:
+        if not sync_result.get('success', False):
             return jsonify({
                 "status": "error",
-                "message": "Yahoo Finance returned no data. You are likely being rate-limited.",
-                "symbol": symbol
-            }), 503  # Service Unavailable
-
-        new_data = []
-        for date, row in hist.iterrows():
-            new_data.append({
-                "date": date.strftime('%Y-%m-%d'),
-                "open": float(round(row['Open'], 2)),
-                "high": float(round(row['High'], 2)),
-                "low": float(round(row['Low'], 2)),
-                "close": float(round(row['Close'], 2)),
-                "volume": int(row['Volume']) if 'Volume' in row else 0
-            })
-        
-        # 3. Only save to Firebase if we actually have data
-        asset_ref = db.collection('historical_data').document(api_symbol)
-        asset_ref.set({
-            "daily": new_data,
-            "symbol": symbol,
-            "last_synced": datetime.now().isoformat(),
-            "data_points": len(new_data)
-        }, merge=False)
+                "symbol": symbol,
+                "error": sync_result.get('error', 'Unknown error'),
+                "source": sync_result.get('source', 'unknown'),
+                "message": "Failed to fetch data from any source"
+            }), 503
         
         return jsonify({
             "status": "synced",
             "symbol": symbol,
-            "data_points": len(new_data),
-            "period": f"{len(new_data)} days"
+            "data_points": sync_result['data_points'],
+            "source": sync_result['source'],
+            "period": f"{sync_result['data_points']} days",
+            "message": sync_result['message']
         })
         
     except Exception as e:
@@ -663,8 +794,8 @@ def get_ai_insight():
         
         # If no data exists, fetch it first
         if not asset_doc.exists or not asset_doc.to_dict().get('daily'):
-            # Call the sync function internally
-            sync_result = sync_historical_data(symbol, api_symbol)
+            # Call the sync function
+            sync_result = sync_historical_data(symbol)
             if not sync_result.get('success', False):
                 return jsonify({
                     "error": f"Failed to fetch historical data for {symbol}",
@@ -679,6 +810,7 @@ def get_ai_insight():
         
         if not full_data:
             return jsonify({"error": "No daily data available after sync. Please try again."}), 404
+        
         # Convert to DataFrame
         df = pd.DataFrame(full_data)
         
@@ -698,23 +830,39 @@ def get_ai_insight():
         sr_data = calculate_support_resistance(analysis_df)
         patterns = detect_candlestick_patterns(analysis_df)
         
-        # Get news from Alpha Vantage
+        # Get news and sentiment from Alpha Vantage
         news_items = get_alpha_vantage_news(symbol)
         news_titles = [item['title'] for item in news_items[:5]]
-        news_sentiment = "neutral"
-        if news_items:
-            avg_sentiment = sum(item['sentiment_score'] for item in news_items) / len(news_items)
-            if avg_sentiment > 0.1:
-                news_sentiment = "positive"
-            elif avg_sentiment < -0.1:
-                news_sentiment = "negative"
         
-        # Get current price from yfinance for accuracy
-        try:
-            ticker = yf.Ticker(api_symbol, session=session)
-            current_price = float(ticker.fast_info.get('last_price', analysis_df['close'].iloc[-1]))
-        except:
-            current_price = float(analysis_df['close'].iloc[-1])
+        # Calculate comprehensive sentiment
+        news_sentiment = "neutral"
+        sentiment_score = 0
+        
+        if news_items:
+            # Weight sentiment by relevance score
+            weighted_scores = []
+            for item in news_items:
+                sentiment = item.get('sentiment_score', 0)
+                relevance = item.get('relevance_score', 0.5)
+                weighted_scores.append(sentiment * relevance)
+            
+            if weighted_scores:
+                avg_sentiment = sum(weighted_scores) / len(weighted_scores)
+                sentiment_score = avg_sentiment
+                
+                if avg_sentiment > 0.2:
+                    news_sentiment = "strongly positive"
+                elif avg_sentiment > 0.1:
+                    news_sentiment = "positive"
+                elif avg_sentiment < -0.2:
+                    news_sentiment = "strongly negative"
+                elif avg_sentiment < -0.1:
+                    news_sentiment = "negative"
+                else:
+                    news_sentiment = "neutral"
+        
+        # Get current price from the most recent data
+        current_price = float(analysis_df['close'].iloc[-1])
         
         # Prepare data for AI
         technical_summary = {
@@ -723,6 +871,7 @@ def get_ai_insight():
             "current_price": current_price,
             "price_formatted": format_currency(current_price),
             "data_period": f"{len(analysis_df)} days",
+            "data_source": data_dict.get('data_source', 'unknown'),
             "moving_averages": {
                 "MA20": format_currency(ma_data.get('MA20', 0)),
                 "MA50": format_currency(ma_data.get('MA50', 0)),
@@ -750,8 +899,10 @@ def get_ai_insight():
             "patterns_detected": patterns,
             "news": {
                 "sentiment": news_sentiment,
+                "sentiment_score": round(sentiment_score, 3),
                 "headlines": news_titles,
-                "count": len(news_titles)
+                "count": len(news_titles),
+                "source": "Alpha Vantage News Sentiment API"
             }
         }
         
@@ -762,6 +913,7 @@ def get_ai_insight():
         ANALYSIS TYPE: {description}
         CURRENT PRICE: {technical_summary['price_formatted']}
         DATA PERIOD: {technical_summary['data_period']}
+        DATA SOURCE: {technical_summary['data_source'].upper()}
         
         MOVING AVERAGES:
         - MA20: {technical_summary['moving_averages']['MA20']}
@@ -788,7 +940,8 @@ def get_ai_insight():
         PATTERNS DETECTED:
         {chr(10).join([f"- {pattern}" for pattern in patterns])}
         
-        NEWS SENTIMENT: {technical_summary['news']['sentiment'].upper()}
+        NEWS SENTIMENT: {technical_summary['news']['sentiment'].upper()} (Score: {technical_summary['news']['sentiment_score']})
+        SENTIMENT SOURCE: {technical_summary['news']['source']}
         RECENT HEADLINES ({technical_summary['news']['count']}):
         {chr(10).join([f"- {headline}" for headline in technical_summary['news']['headlines']])}
         
@@ -798,7 +951,7 @@ def get_ai_insight():
         3. Moving average alignment implications
         4. Pattern recognition analysis
         5. Support/resistance breakout potential
-        6. News sentiment impact
+        6. News sentiment impact with quantifiable score
         7. Risk assessment with specific risk factors
         8. Clear trading recommendation with entry/exit levels
         
@@ -808,7 +961,7 @@ def get_ai_insight():
         - fibonacci_analysis: (string) Detailed Fibonacci interpretation
         - ma_analysis: (string) Moving average analysis with implications
         - support_resistance_analysis: (string) Breakout/breakdown potential
-        - news_impact: (string) How news affects the analysis
+        - news_impact: (string) How news sentiment affects the analysis
         - risk_assessment: (string) Specific risk factors (Low/Medium/High)
         - verdict: (string) Comprehensive analysis conclusion
         - suggestion: (string) BUY/HOLD/SELL with conviction
@@ -841,7 +994,8 @@ def get_ai_insight():
                 "symbol": symbol,
                 "interval": interval_type,
                 "analysis_date": datetime.now().isoformat(),
-                "data_points": len(analysis_df)
+                "data_points": len(analysis_df),
+                "data_source": technical_summary['data_source']
             }
         }
         
@@ -856,8 +1010,110 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "alpha_vantage_available": bool(ALPHA_VANTAGE_API_KEY)
+        "alpha_vantage_available": bool(ALPHA_VANTAGE_API_KEY),
+        "alpha_vantage_key_set": bool(ALPHA_VANTAGE_API_KEY)
     })
+
+# ==================== LOCAL SYNC ENDPOINT ====================
+
+@app.route('/local-sync', methods=['POST'])
+def local_sync():
+    """
+    Endpoint for manual sync from your laptop.
+    This should be called from your local machine to populate Firebase.
+    """
+    # Add simple authentication (you can improve this)
+    auth_key = request.headers.get('X-Auth-Key')
+    if auth_key != os.getenv('LOCAL_SYNC_KEY', 'default-sync-key'):
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    data = request.get_json()
+    symbol = data.get('symbol')
+    historical_data = data.get('data', [])
+    
+    if not symbol or not historical_data:
+        return jsonify({"error": "Symbol and data are required"}), 400
+    
+    try:
+        api_symbol = get_api_symbol(symbol)
+        asset_ref = db.collection('historical_data').document(api_symbol)
+        
+        # Store the data
+        asset_ref.set({
+            "daily": historical_data,
+            "symbol": symbol,
+            "last_synced": datetime.now().isoformat(),
+            "data_points": len(historical_data),
+            "data_source": "local_sync",
+            "synced_from": "local_machine"
+        }, merge=False)
+        
+        return jsonify({
+            "status": "synced",
+            "symbol": symbol,
+            "data_points": len(historical_data),
+            "message": f"Locally synced {len(historical_data)} days of data for {symbol}"
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ==================== LOCAL SYNC ENDPOINT ====================
+
+@app.route('/local-sync', methods=['POST'])
+def local_sync():
+    """
+    Endpoint for manual sync from your laptop.
+    This should be called from your local machine to populate Firebase.
+    """
+    # Add simple authentication
+    auth_key = request.headers.get('X-Auth-Key')
+    expected_key = os.getenv('LOCAL_SYNC_KEY')
+    
+    if not expected_key:
+        return jsonify({"error": "LOCAL_SYNC_KEY not configured on server"}), 500
+    
+    if auth_key != expected_key:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No JSON data provided"}), 400
+    
+    symbol = data.get('symbol')
+    historical_data = data.get('data', [])
+    
+    if not symbol:
+        return jsonify({"error": "Symbol is required"}), 400
+    
+    if not historical_data:
+        return jsonify({"error": "Historical data array is required"}), 400
+    
+    try:
+        api_symbol = get_api_symbol(symbol)
+        asset_ref = db.collection('historical_data').document(api_symbol)
+        
+        # Store the data
+        asset_ref.set({
+            "daily": historical_data,
+            "symbol": symbol,
+            "last_synced": datetime.now().isoformat(),
+            "data_points": len(historical_data),
+            "data_source": "local_sync",
+            "synced_from": "local_machine"
+        }, merge=False)
+        
+        return jsonify({
+            "status": "synced",
+            "symbol": symbol,
+            "api_symbol": api_symbol,
+            "data_points": len(historical_data),
+            "message": f"Locally synced {len(historical_data)} days of data for {symbol}"
+        })
+        
+    except Exception as e:
+        print(f"Local sync error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
