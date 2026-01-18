@@ -714,33 +714,26 @@ def detect_chart_patterns(df: pd.DataFrame, interval: str = 'daily') -> List[str
         print(f"Chart pattern detection error for {interval}: {e}")
         return []
 
-def calculate_support_resistance(df: pd.DataFrame, interval: str = 'daily', current_price: Optional[float] = None) -> Dict:
-    """Calculate support and resistance levels using FULL dataset, not downsampled"""
+def calculate_support_resistance_on_timeframe(df: pd.DataFrame, current_price: Optional[float] = None) -> Dict:
+    """Calculate support and resistance levels on the SELECTED TIMEFRAME (not interval-based)"""
     
-    # Interval-specific lookback
-    if interval == 'monthly':
-        lookback = min(24, len(df))  # Last 24 months
-        min_required = 12
-    else:  # daily
-        lookback = min(90, len(df))  # Last 90 days
-        min_required = 30
+    # Use the ENTIRE selected timeframe, no lookback
+    min_required = 5  # Absolute minimum
     
     if len(df) < min_required:
         return {
             'support': 0,
             'resistance': 0,
-            'support_pivot': 0,
-            'resistance_pivot': 0,
-            'closest_level': f"Insufficient data ({len(df)} points)",
+            'pivot': 0,
+            'closest_level': f"Insufficient data ({len(df)} points, need at least {min_required})",
             'strength': "Weak"
         }
     
     try:
-        # Use ORIGINAL full dataset, not downsampled
-        recent = df.tail(lookback)
-        high = float(recent['high'].max() if 'high' in recent.columns else recent['close'].max())
-        low = float(recent['low'].min() if 'low' in recent.columns else recent['close'].min())
-        close = float(recent['close'].iloc[-1])
+        # Use ALL data in the selected timeframe
+        high = float(df['high'].max() if 'high' in df.columns else df['close'].max())
+        low = float(df['low'].min() if 'low' in df.columns else df['close'].min())
+        close = float(df['close'].iloc[-1])
         
         # Pivot points
         pivot = (high + low + close) / 3
@@ -750,7 +743,7 @@ def calculate_support_resistance(df: pd.DataFrame, interval: str = 'daily', curr
         s2 = pivot - (high - low)
         
         # Use provided current_price or fall back to last close
-        price_to_use = current_price if current_price is not None else float(df['close'].iloc[-1])
+        price_to_use = current_price if current_price is not None else close
         
         # Determine closest level
         levels = {
@@ -772,7 +765,7 @@ def calculate_support_resistance(df: pd.DataFrame, interval: str = 'daily', curr
             'closest_level': closest_level[0],
             'distance_pct': round(abs(closest_level[1] - price_to_use) / price_to_use * 100, 2),
             'strength': "Strong" if abs(closest_level[1] - price_to_use) / price_to_use < 0.02 else "Moderate",
-            'lookback_period': f"{lookback} {interval} candles"
+            'timeframe_candles': len(df)
         }
         
     except Exception as e:
@@ -780,6 +773,7 @@ def calculate_support_resistance(df: pd.DataFrame, interval: str = 'daily', curr
         return {
             'support': 0,
             'resistance': 0,
+            'pivot': 0,
             'closest_level': "Calculation error",
             'strength': "Unknown"
         }
@@ -883,15 +877,24 @@ def get_ai_insight():
                 return jsonify({"error": "Data sync failed", "message": sync_result.get('error')}), 503
             data_dict = db.collection('historical_data').document(api_symbol).get().to_dict()
         
-        # 3. Get appropriate data
-        data_pool = data_dict.get('monthly', []) if interval == 'monthly' else data_dict.get('daily', [])
-        if not data_pool:
-            data_pool = data_dict.get('daily', [])
-            
-        df = pd.DataFrame(data_pool)
-        df['date'] = pd.to_datetime(df['date'])
+        # 3. Get FULL dataset (for MA calculation)
+        full_data_pool = data_dict.get('monthly', []) if interval == 'monthly' else data_dict.get('daily', [])
+        if not full_data_pool:
+            full_data_pool = data_dict.get('daily', [])
         
-        # 4. Apply timeframe filter
+        # Create FULL dataframe for MA calculation
+        full_df = pd.DataFrame(full_data_pool)
+        full_df['date'] = pd.to_datetime(full_df['date'])
+        full_df = full_df.sort_values('date')
+        
+        # 4. **STEP 1: Calculate Moving Averages on FULL DATASET**
+        # This ensures MA200 is always available, even for 15-day timeframes
+        ma_data = calculate_moving_averages(full_df)
+        
+        # 5. **STEP 2: Apply timeframe filter for analysis**
+        # This creates the "viewing window" for the AI
+        df = full_df.copy()
+        
         if timeframe.endswith('y'):
             years_to_keep = int(timeframe.replace('y', ''))
             if interval == 'monthly':
@@ -913,38 +916,39 @@ def get_ai_insight():
             cutoff_date = datetime.now() - timedelta(days=days_to_keep)
             df = df[df['date'] >= cutoff_date]
 
-        # 5. **FETCH REAL-TIME PRICE**
+        # 6. **FETCH REAL-TIME PRICE**
         realtime_price = get_realtime_price(symbol)
-        historical_price = float(df['close'].iloc[-1])
+        historical_price = float(full_df['close'].iloc[-1])  # Use full_df for latest price
         
         # Use real-time if available, otherwise fall back to historical
         current_price = realtime_price if realtime_price else historical_price
         price_source = "real-time" if realtime_price else "historical (last close)"
         
-        # 6. Calculate MA on FULL timeframe
-        ma_data = calculate_moving_averages(df)
-        
-        # 7. **IMPROVED VOLUME CALCULATION**
+        # 7. **STEP 3: Calculate VOLUME on SELECTED TIMEFRAME**
         latest_point = df.iloc[-1]
         last_period_volume = float(latest_point['volume'])
         
-        # Calculate average and total for context
+        # Calculate average and total for the SELECTED timeframe
         total_volume = float(df['volume'].sum())
         average_volume = float(df['volume'].mean())
         
-        # Determine volume trend (is last period above or below average?)
+        # Determine volume trend
         volume_vs_average = "Above Average" if last_period_volume > average_volume else "Below Average"
         volume_change_pct = round(((last_period_volume - average_volume) / average_volume * 100), 2) if average_volume > 0 else 0
         
-        # 8. DOWNSAMPLE to 50 points for AI context only
-        analysis_df = downsample_to_50_points(df)
-        
-        # 9. **Use FULL DF for Support/Resistance and Fibonacci with real-time price**
+        # 8. **STEP 4: Calculate Fibonacci on SELECTED TIMEFRAME with interval-aware lookback**
+        # Fibonacci uses the selected timeframe but with its own lookback logic
         fib_data = calculate_fibonacci_retracement(df, interval, current_price)
-        sr_data = calculate_support_resistance(df, interval, current_price)
+        
+        # 9. **STEP 5: Calculate Support/Resistance on SELECTED TIMEFRAME**
+        # S/R uses the ENTIRE selected timeframe (not interval-based lookback)
+        sr_data = calculate_support_resistance_on_timeframe(df, current_price)
+        
+        # 10. DOWNSAMPLE to 50 points for pattern detection only
+        analysis_df = downsample_to_50_points(df)
         patterns = detect_candlestick_patterns(analysis_df, interval) or ["No patterns detected"]
         
-        # 10. **UPDATED TECHNICAL SUMMARY WITH ENHANCED VOLUME DATA**
+        # 11. **UPDATED TECHNICAL SUMMARY**
         technical_summary = {
             "symbol": symbol,
             "analysis_type": description,
@@ -961,6 +965,7 @@ def get_ai_insight():
             },
             "price_formatted": format_currency(current_price),
             "data_period": f"{len(df)} {interval} candles (analyzed: {len(analysis_df)} points)",
+            "full_history": f"{len(full_df)} {interval} candles available",
             "data_source": data_dict.get('data_source', 'unknown'),
             "moving_averages": {
                 "MA13": format_currency(ma_data['MA13']) if ma_data['MA13'] != "N/A" else "N/A",
@@ -970,7 +975,8 @@ def get_ai_insight():
                 "MA200": format_currency(ma_data['MA200']) if ma_data['MA200'] != "N/A" else "N/A",
                 "trend": ma_data.get('trend', 'Unknown'),
                 "alignment": ma_data.get('ma_alignment', 'Unknown'),
-                "golden_cross": ma_data.get('golden_cross', 'Unknown')
+                "golden_cross": ma_data.get('golden_cross', 'Unknown'),
+                "calculated_on": f"Full {len(full_df)} {interval} history"
             },
             "fibonacci": {
                 "zone": fib_data.get('current_zone', 'Unknown'),
@@ -989,21 +995,22 @@ def get_ai_insight():
                 "closest_level": sr_data.get('closest_level', 'Unknown'),
                 "distance": f"{sr_data.get('distance_pct', 0)}%",
                 "strength": sr_data.get('strength', 'Unknown'),
-                "lookback": sr_data.get('lookback_period', 'N/A')
+                "calculated_on": f"{len(df)} {interval} candles (selected timeframe)"
             },
             "patterns_detected": patterns
         }
         
-        # 11. **UPDATED AI PROMPT WITH ENHANCED VOLUME CONTEXT**
+        # 12. Create AI prompt
         prompt = f"""
         Perform a comprehensive technical analysis for {symbol} based on the following data:
         
         ANALYSIS TYPE: {description}
         CURRENT PRICE: {technical_summary['price_formatted']} ({price_source})
         DATA PERIOD: {technical_summary['data_period']}
+        FULL HISTORY: {technical_summary['full_history']}
         DATA SOURCE: {technical_summary['data_source'].upper()}
         
-        MOVING AVERAGES:
+        MOVING AVERAGES (calculated on {technical_summary['moving_averages']['calculated_on']}):
         - MA13: {technical_summary['moving_averages']['MA13']}
         - MA20: {technical_summary['moving_averages']['MA20']}
         - MA21: {technical_summary['moving_averages']['MA21']}
@@ -1021,7 +1028,7 @@ def get_ai_insight():
         - Swing Low: {technical_summary['fibonacci']['swing_low']}
         - Position: {technical_summary['fibonacci']['current_vs_high']}, {technical_summary['fibonacci']['current_vs_low']}
         
-        SUPPORT & RESISTANCE ({sr_data.get('lookback_period', 'N/A')}):
+        SUPPORT & RESISTANCE ({technical_summary['support_resistance']['calculated_on']}):
         - Support: {technical_summary['support_resistance']['support']}
         - Resistance: {technical_summary['support_resistance']['resistance']}
         - Pivot: {technical_summary['support_resistance']['pivot']}
@@ -1031,7 +1038,7 @@ def get_ai_insight():
         PATTERNS DETECTED:
         {chr(10).join([f"- {pattern}" for pattern in patterns])}
 
-        VOLUME ANALYSIS:
+        VOLUME ANALYSIS (for selected {len(df)} {interval} timeframe):
         - Last {interval_type} Volume: {last_period_volume:,.0f}
         - Average {interval_type} Volume: {average_volume:,.0f}
         - Volume Status: {volume_vs_average} ({volume_change_pct:+.1f}% vs average)
@@ -1039,17 +1046,15 @@ def get_ai_insight():
         
         Based on ALL technical indicators above, provide a comprehensive analysis including:
         1. Overall trend assessment with confidence level
-        2. Significance of Fibonacci retracement level (note the lookback period used)
-        3. Moving average alignment implications (focus on 13, 20, 21, 50, 200 MA)
-        4. Volume analysis: The last {interval_type.lower()} volume is {volume_vs_average} by {abs(volume_change_pct):.1f}%. 
-           Determine if this indicates BUYING PRESSURE, SELLING PRESSURE, or MODERATE ACTIVITY.
-        5. Volume confirmation: Does the volume support the current price trend?
+        2. Moving averages: Note that MAs are calculated on the FULL history ({len(full_df)} candles), providing long-term context
+        3. Fibonacci retracement significance
+        4. Support/Resistance levels based on the selected {len(df)}-candle timeframe
+        5. Volume analysis for the selected timeframe
         6. Pattern recognition analysis
-        7. Support/resistance breakout potential (note the lookback period used)
-        8. Risk assessment with specific risk factors
-        9. Clear trading recommendation with entry/exit levels
+        7. Risk assessment with specific risk factors
+        8. Clear trading recommendation with entry/exit levels
         
-        Note: Current price is from {price_source}. If real-time, it may differ from the last historical close.
+        Note: Current price is from {price_source}.
         
         Respond in valid JSON format with these exact fields:
         - trend: (string) Overall market trend with confidence
@@ -1066,7 +1071,7 @@ def get_ai_insight():
         - key_levels: (object) Important price levels to watch
         """
 
-        # 12. Get AI response
+        # 13. Get AI response
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -1082,7 +1087,7 @@ def get_ai_insight():
         
         ai_response = json.loads(response.choices[0].message.content)
         
-        # 13. Combine all data
+        # 14. Combine all data
         result = {
             **ai_response,
             "technical_summary": technical_summary,
@@ -1091,6 +1096,7 @@ def get_ai_insight():
                 "interval": interval_type,
                 "analysis_date": datetime.now().isoformat(),
                 "data_points": len(df),
+                "full_data_points": len(full_df),
                 "analyzed_points": len(analysis_df),
                 "data_source": technical_summary['data_source'],
                 "price_source": price_source
