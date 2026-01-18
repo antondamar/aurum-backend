@@ -223,130 +223,72 @@ def aggregate_to_monthly(daily_data: List[Dict]) -> List[Dict]:
     return sorted(monthly_data.values(), key=lambda x: x['date'])
 
 def calculate_moving_averages(df: pd.DataFrame) -> Dict:
-    """Calculate various moving averages with proper validation"""
+    """Calculate moving averages individually based on available data length"""
     ma_data = {}
     
     try:
-        # We need FULL data for MA calculation, not downsampled
-        if len(df) >= 200:  # Need at least 200 points for MA200
-            closes = df['close'].values
-            
-            # Calculate moving averages using pandas rolling
-            ma13 = pd.Series(closes).rolling(window=13).mean()
-            ma20 = pd.Series(closes).rolling(window=20).mean()
-            ma21 = pd.Series(closes).rolling(window=21).mean()
-            ma50 = pd.Series(closes).rolling(window=50).mean()
-            ma200 = pd.Series(closes).rolling(window=200).mean()
-            
-            current_price = float(closes[-1])
-            
-            # Get last valid values
-            ma13_val = float(ma13.iloc[-1]) if not pd.isna(ma13.iloc[-1]) else 0
-            ma20_val = float(ma20.iloc[-1]) if not pd.isna(ma20.iloc[-1]) else 0
-            ma21_val = float(ma21.iloc[-1]) if not pd.isna(ma21.iloc[-1]) else 0
-            ma50_val = float(ma50.iloc[-1]) if not pd.isna(ma50.iloc[-1]) else 0
-            ma200_val = float(ma200.iloc[-1]) if not pd.isna(ma200.iloc[-1]) else 0
-            
-            # Determine trend
-            if ma20_val > 0 and ma50_val > 0 and ma200_val > 0:
-                # Golden/Death cross detection
-                golden_cross = ma50_val > ma200_val
-                
-                # Price position relative to MAs
-                above_ma13 = current_price > ma13_val
-                above_ma20 = current_price > ma20_val
-                above_ma21 = current_price > ma21_val
-                above_ma50 = current_price > ma50_val
-                above_ma200 = current_price > ma200_val
-                
-                # Count how many MAs price is above
-                ma_count_above = sum([above_ma13, above_ma20, above_ma21, above_ma50, above_ma200])
-                
-                # Determine overall trend
-                if ma_count_above >= 4:
-                    trend = "Strong Bullish"
-                elif ma_count_above >= 3:
-                    trend = "Bullish"
-                elif ma_count_above <= 1:
-                    trend = "Bearish"
-                else:
-                    trend = "Neutral"
-                
-                # Determine MA alignment
-                if ma13_val > ma20_val > ma21_val > ma50_val > ma200_val:
-                    alignment = "Strong Bullish Alignment"
-                elif ma13_val < ma20_val < ma21_val < ma50_val < ma200_val:
-                    alignment = "Strong Bearish Alignment"
-                else:
-                    alignment = "Mixed Alignment"
-                
-                ma_data = {
-                    'MA13': ma13_val,
-                    'MA20': ma20_val,
-                    'MA21': ma21_val,
-                    'MA50': ma50_val,
-                    'MA200': ma200_val,
-                    'trend': trend,
-                    'golden_cross': "Yes" if golden_cross else "No",
-                    'price_vs_ma13': "Above" if above_ma13 else "Below",
-                    'price_vs_ma20': "Above" if above_ma20 else "Below",
-                    'price_vs_ma21': "Above" if above_ma21 else "Below",
-                    'price_vs_ma50': "Above" if above_ma50 else "Below",
-                    'price_vs_ma200': "Above" if above_ma200 else "Below",
-                    'ma_alignment': alignment,
-                    'ma_count_above': ma_count_above
-                }
+        closes = pd.Series(df['close'].values)
+        data_len = len(closes)
+        current_price = float(closes.iloc[-1])
+        
+        # Define windows to check independently
+        windows = [13, 20, 21, 50, 200]
+        ma_values = {}
+        
+        for w in windows:
+            if data_len >= w:
+                # Calculate if we have enough points for this specific window
+                val = float(closes.rolling(window=w).mean().iloc[-1])
+                ma_values[f"MA{w}"] = round(val, 2)
             else:
-                ma_data = {
-                    'MA13': 0,
-                    'MA20': 0,
-                    'MA21': 0,
-                    'MA50': 0,
-                    'MA200': 0,
-                    'trend': "Insufficient valid data",
-                    'golden_cross': "Unknown",
-                    'price_vs_ma13': "Unknown",
-                    'price_vs_ma20': "Unknown",
-                    'price_vs_ma21': "Unknown",
-                    'price_vs_ma50': "Unknown",
-                    'price_vs_ma200': "Unknown",
-                    'ma_alignment': "Unknown"
-                }
-        else:
-            needed_points = 200 - len(df)
-            ma_data = {
-                'MA13': 0,
-                'MA20': 0,
-                'MA21': 0,
-                'MA50': 0,
-                'MA200': 0,
-                'trend': f"Need {needed_points} more points for full analysis",
-                'golden_cross': "Unknown",
-                'price_vs_ma13': "Unknown",
-                'price_vs_ma20': "Unknown",
-                'price_vs_ma21': "Unknown",
-                'price_vs_ma50': "Unknown",
-                'price_vs_ma200': "Unknown",
-                'ma_alignment': "Unknown"
-            }
-            
+                # Mark as N/A if history is too short for this timeframe
+                ma_values[f"MA{w}"] = "N/A"
+        
+        # Determine trend based ONLY on AVAILABLE MAs
+        active_mas = {k: v for k, v in ma_values.items() if v != "N/A"}
+        
+        if not active_mas:
+            return {f"MA{w}": "N/A" for w in windows} | {"trend": "Insufficient Data", "ma_alignment": "N/A"}
+
+        # Count price position relative to active MAs
+        above_count = sum(1 for v in active_mas.values() if current_price > v)
+        total_active = len(active_mas)
+        
+        # Dynamic Trend Logic: Percentage of active MAs the price is above
+        ratio = above_count / total_active
+        if ratio >= 0.8: trend = "Strong Bullish"
+        elif ratio >= 0.6: trend = "Bullish"
+        elif ratio <= 0.2: trend = "Strong Bearish"
+        elif ratio <= 0.4: trend = "Bearish"
+        else: trend = "Neutral"
+
+        # Alignment check (check if MAs are stacked in order)
+        alignment = "Mixed"
+        sorted_keys = sorted(active_mas.keys(), key=lambda x: int(x[2:])) # Sort by window size
+        active_vals = [active_mas[k] for k in sorted_keys]
+        if active_vals == sorted(active_vals, reverse=True):
+            alignment = "Bullish Stack"
+        elif active_vals == sorted(active_vals):
+            alignment = "Bearish Stack"
+
+        ma_data = {
+            **ma_values,
+            'trend': trend,
+            'golden_cross': "Yes" if (ma_values['MA50'] != "N/A" and ma_values['MA200'] != "N/A" and ma_values['MA50'] > ma_values['MA200']) else "No" if (ma_values['MA50'] != "N/A" and ma_values['MA200'] != "N/A") else "N/A",
+            'ma_alignment': alignment,
+            'ma_count_above': above_count,
+            'total_active_mas': total_active
+        }
+        
+        # Add directional flags for the AI context
+        for w in windows:
+            val = ma_values[f"MA{w}"]
+            ma_data[f'price_vs_ma{w}'] = "Above" if val != "N/A" and current_price > val else "Below" if val != "N/A" else "N/A"
+
     except Exception as e:
         print(f"Moving average calculation error: {e}")
-        ma_data = {
-            'MA13': 0,
-            'MA20': 0,
-            'MA21': 0,
-            'MA50': 0,
-            'MA200': 0,
-            'trend': "Calculation error",
-            'golden_cross': "Unknown",
-            'price_vs_ma13': "Unknown",
-            'price_vs_ma20': "Unknown",
-            'price_vs_ma21': "Unknown",
-            'price_vs_ma50': "Unknown",
-            'price_vs_ma200': "Unknown",
-            'ma_alignment': "Unknown"
-        }
+        ma_data = {f"MA{w}": "N/A" for w in [13, 20, 21, 50, 200]}
+        ma_data['trend'] = "Calculation Error"
     
     return ma_data
 
@@ -945,11 +887,11 @@ def get_ai_insight():
             "data_period": f"{len(analysis_df)} points (downsampled)",
             "data_source": data_dict.get('data_source', 'unknown'),
             "moving_averages": {
-                "MA13": format_currency(ma_data.get('MA13', 0)),
-                "MA20": format_currency(ma_data.get('MA20', 0)),
-                "MA21": format_currency(ma_data.get('MA21', 0)),
-                "MA50": format_currency(ma_data.get('MA50', 0)),
-                "MA200": format_currency(ma_data.get('MA200', 0)),
+                "MA13": format_currency(ma_data['MA13']) if ma_data['MA13'] != "N/A" else "N/A",
+                "MA20": format_currency(ma_data['MA20']) if ma_data['MA20'] != "N/A" else "N/A",
+                "MA21": format_currency(ma_data['MA21']) if ma_data['MA21'] != "N/A" else "N/A",
+                "MA50": format_currency(ma_data['MA50']) if ma_data['MA50'] != "N/A" else "N/A",
+                "MA200": format_currency(ma_data['MA200']) if ma_data['MA200'] != "N/A" else "N/A",
                 "trend": ma_data.get('trend', 'Unknown'),
                 "alignment": ma_data.get('ma_alignment', 'Unknown'),
                 "golden_cross": ma_data.get('golden_cross', 'Unknown')
