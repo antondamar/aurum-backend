@@ -227,25 +227,31 @@ def get_yfinance_historical(symbol: str, period: str = "2y") -> Optional[pd.Data
 # ==================== SYNC FUNCTION ====================
 
 def sync_historical_data(symbol: str) -> Dict:
-    """Sync historical data with Alpha Vantage as primary, yfinance as fallback"""
+    """Sync historical data with safety checks"""
     try:
-        print(f"Starting sync for {symbol}")
+        # Check if we already have recent data in Firebase first
+        api_symbol = get_api_symbol(symbol)
+        existing_doc = db.collection('historical_data').document(api_symbol).get()
         
-        # Try Alpha Vantage first
-        print(f"Trying Alpha Vantage for {symbol}...")
+        if existing_doc.exists:
+            data = existing_doc.to_dict()
+            last_synced = datetime.fromisoformat(data.get('last_synced'))
+            # If synced within the last 12 hours, don't hit the API
+            if datetime.now() - last_synced < timedelta(hours=12):
+                return {"success": True, "source": "firebase_cache", "data_points": len(data.get('daily', []))}
+
+        # If we must fetch, try Alpha Vantage
         df = get_alpha_vantage_historical(symbol, "2y")
         source = "alpha_vantage"
         
-        # If Alpha Vantage fails, try yfinance
         if df is None or df.empty:
-            print(f"Alpha Vantage failed for {symbol}, trying yfinance...")
             df = get_yfinance_historical(symbol, "2y")
             source = "yfinance"
         
-        # If both fail, create mock data for testing
         if df is None or df.empty:
-            print(f"Both Alpha Vantage and yFinance failed for {symbol}. Creating mock data...")
-            return create_mock_historical_data(symbol)
+            # IMPORTANT: Do NOT call create_mock_historical_data here. 
+            # It's better to fail than to overwrite BTC with $100 fake data.
+            return {"success": False, "error": "API Rate Limit reached. Using cached data if available."}
         
         # Prepare data for Firebase
         new_data = []
@@ -1027,8 +1033,6 @@ def get_ai_insight():
             data_pool = data_dict.get('daily', [])
             
         df = pd.DataFrame(data_pool)
-        
-        # 3. Filter by timeframe - handle both 'y' and 'm' formats
         df['date'] = pd.to_datetime(df['date'])
         
         if timeframe.endswith('y'):
