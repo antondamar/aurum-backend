@@ -913,7 +913,7 @@ def get_ai_insight():
             cutoff_date = datetime.now() - timedelta(days=days_to_keep)
             df = df[df['date'] >= cutoff_date]
 
-        # 5. **FETCH REAL-TIME PRICE** (NEW)
+        # 5. **FETCH REAL-TIME PRICE**
         realtime_price = get_realtime_price(symbol)
         historical_price = float(df['close'].iloc[-1])
         
@@ -924,26 +924,41 @@ def get_ai_insight():
         # 6. Calculate MA on FULL timeframe
         ma_data = calculate_moving_averages(df)
         
-        # 7. Get volume (last candle's total volume)
+        # 7. **IMPROVED VOLUME CALCULATION**
         latest_point = df.iloc[-1]
-        current_volume = float(latest_point['volume'])
+        last_period_volume = float(latest_point['volume'])
+        
+        # Calculate average and total for context
+        total_volume = float(df['volume'].sum())
+        average_volume = float(df['volume'].mean())
+        
+        # Determine volume trend (is last period above or below average?)
+        volume_vs_average = "Above Average" if last_period_volume > average_volume else "Below Average"
+        volume_change_pct = round(((last_period_volume - average_volume) / average_volume * 100), 2) if average_volume > 0 else 0
         
         # 8. DOWNSAMPLE to 50 points for AI context only
         analysis_df = downsample_to_50_points(df)
         
-        # 9. **FIXED: Use FULL DF for Support/Resistance and Fibonacci**
-        # Pass current_price to ensure real-time price is used in calculations
+        # 9. **Use FULL DF for Support/Resistance and Fibonacci with real-time price**
         fib_data = calculate_fibonacci_retracement(df, interval, current_price)
         sr_data = calculate_support_resistance(df, interval, current_price)
         patterns = detect_candlestick_patterns(analysis_df, interval) or ["No patterns detected"]
         
-        # 10. Prepare technical summary
+        # 10. **UPDATED TECHNICAL SUMMARY WITH ENHANCED VOLUME DATA**
         technical_summary = {
             "symbol": symbol,
             "analysis_type": description,
             "current_price": current_price,
-            "price_source": price_source,  # NEW
-            "volume": current_volume,
+            "price_source": price_source,
+            "volume": {
+                "last_period": last_period_volume,
+                "average": average_volume,
+                "total": total_volume,
+                "vs_average": volume_vs_average,
+                "change_pct": volume_change_pct,
+                "period_label": f"Last {interval_type.lower()} candle",
+                "average_label": f"Avg {interval_type.lower()} volume"
+            },
             "price_formatted": format_currency(current_price),
             "data_period": f"{len(df)} {interval} candles (analyzed: {len(analysis_df)} points)",
             "data_source": data_dict.get('data_source', 'unknown'),
@@ -965,7 +980,7 @@ def get_ai_insight():
                 "swing_low": format_currency(fib_data.get('swing_low', 0)),
                 "current_vs_high": f"{fib_data.get('distance_from_high_pct', 0)}% below high",
                 "current_vs_low": f"{fib_data.get('distance_from_low_pct', 0)}% above low",
-                "lookback": fib_data.get('lookback_period', 'N/A')  # NEW
+                "lookback": fib_data.get('lookback_period', 'N/A')
             },
             "support_resistance": {
                 "support": format_currency(sr_data.get('support', 0)),
@@ -974,12 +989,12 @@ def get_ai_insight():
                 "closest_level": sr_data.get('closest_level', 'Unknown'),
                 "distance": f"{sr_data.get('distance_pct', 0)}%",
                 "strength": sr_data.get('strength', 'Unknown'),
-                "lookback": sr_data.get('lookback_period', 'N/A')  # NEW
+                "lookback": sr_data.get('lookback_period', 'N/A')
             },
             "patterns_detected": patterns
         }
         
-        # 11. Create AI prompt (updated with new info)
+        # 11. **UPDATED AI PROMPT WITH ENHANCED VOLUME CONTEXT**
         prompt = f"""
         Perform a comprehensive technical analysis for {symbol} based on the following data:
         
@@ -1016,14 +1031,19 @@ def get_ai_insight():
         PATTERNS DETECTED:
         {chr(10).join([f"- {pattern}" for pattern in patterns])}
 
-        VOLUME: {technical_summary['volume']} ({interval_type} total)
+        VOLUME ANALYSIS:
+        - Last {interval_type} Volume: {last_period_volume:,.0f}
+        - Average {interval_type} Volume: {average_volume:,.0f}
+        - Volume Status: {volume_vs_average} ({volume_change_pct:+.1f}% vs average)
+        - Total Volume (timeframe): {total_volume:,.0f}
         
         Based on ALL technical indicators above, provide a comprehensive analysis including:
         1. Overall trend assessment with confidence level
         2. Significance of Fibonacci retracement level (note the lookback period used)
         3. Moving average alignment implications (focus on 13, 20, 21, 50, 200 MA)
-        4. Volume analysis: determine if participants are BUYING, SELLING, or MODERATE
-        5. Volume confirmation of price trend
+        4. Volume analysis: The last {interval_type.lower()} volume is {volume_vs_average} by {abs(volume_change_pct):.1f}%. 
+           Determine if this indicates BUYING PRESSURE, SELLING PRESSURE, or MODERATE ACTIVITY.
+        5. Volume confirmation: Does the volume support the current price trend?
         6. Pattern recognition analysis
         7. Support/resistance breakout potential (note the lookback period used)
         8. Risk assessment with specific risk factors
@@ -1036,6 +1056,7 @@ def get_ai_insight():
         - patterns: (array of strings) Key technical patterns with explanations
         - fibonacci_analysis: (string) Detailed Fibonacci interpretation
         - ma_analysis: (string) Moving average analysis with implications
+        - volume_analysis: (string) Volume trend analysis and what it indicates
         - support_resistance_analysis: (string) Breakout/breakdown potential
         - risk_assessment: (string) Specific risk factors (Low/Medium/High) - max 15 words
         - verdict: (string) Comprehensive analysis conclusion
