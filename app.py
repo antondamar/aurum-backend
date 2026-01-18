@@ -1069,11 +1069,11 @@ def direct_update():
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-# ==================== SIMPLE UPDATE ENDPOINT ====================
-@app.route('/direct-update', methods=['POST'])
-def direct_update():
-    """Simple endpoint to accept data from local sync - NO EXTERNAL API CALLS"""
+    
+# ==================== LOCAL UPLOAD ENDPOINT ====================
+@app.route('/local-upload', methods=['POST'])
+def local_upload():
+    """Endpoint for laptop to upload data"""
     try:
         data = request.get_json()
         symbol = data.get('symbol')
@@ -1091,21 +1091,19 @@ def direct_update():
             "symbol": symbol,
             "last_synced": datetime.now().isoformat(),
             "data_points": len(historical_data),
-            "data_source": "local_sync"
+            "data_source": "local_upload"
         }, merge=False)
         
         return jsonify({
-            "status": "success",
+            "success": True,
             "symbol": symbol,
             "data_points": len(historical_data),
-            "message": f"Updated {len(historical_data)} days of data"
+            "message": f"Uploaded {len(historical_data)} days"
         })
         
     except Exception as e:
-        print(f"Direct update error: {e}")
+        print(f"Upload error: {e}")
         return jsonify({"error": str(e)}), 500
-
-# ==================== MAIN ====================
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
