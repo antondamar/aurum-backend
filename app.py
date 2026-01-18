@@ -1070,6 +1070,41 @@ def direct_update():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ==================== SIMPLE UPDATE ENDPOINT ====================
+@app.route('/direct-update', methods=['POST'])
+def direct_update():
+    """Simple endpoint to accept data from local sync - NO EXTERNAL API CALLS"""
+    try:
+        data = request.get_json()
+        symbol = data.get('symbol')
+        historical_data = data.get('data', [])
+        
+        if not symbol or not historical_data:
+            return jsonify({"error": "Missing symbol or data"}), 400
+        
+        # Store in Firebase
+        api_symbol = get_api_symbol(symbol)
+        asset_ref = db.collection('historical_data').document(api_symbol)
+        
+        asset_ref.set({
+            "daily": historical_data,
+            "symbol": symbol,
+            "last_synced": datetime.now().isoformat(),
+            "data_points": len(historical_data),
+            "data_source": "local_sync"
+        }, merge=False)
+        
+        return jsonify({
+            "status": "success",
+            "symbol": symbol,
+            "data_points": len(historical_data),
+            "message": f"Updated {len(historical_data)} days of data"
+        })
+        
+    except Exception as e:
+        print(f"Direct update error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 # ==================== MAIN ====================
 
 if __name__ == '__main__':
