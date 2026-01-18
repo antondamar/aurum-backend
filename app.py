@@ -324,18 +324,23 @@ def calculate_moving_averages(df: pd.DataFrame) -> Dict:
     ma_data = {}
     
     try:
-        if len(df) >= 200:
+        # We need FULL data for MA calculation, not downsampled
+        if len(df) >= 200:  # Need at least 200 points for MA200
             closes = df['close'].values
             
             # Calculate moving averages using pandas rolling
+            ma13 = pd.Series(closes).rolling(window=13).mean()
             ma20 = pd.Series(closes).rolling(window=20).mean()
+            ma21 = pd.Series(closes).rolling(window=21).mean()
             ma50 = pd.Series(closes).rolling(window=50).mean()
             ma200 = pd.Series(closes).rolling(window=200).mean()
             
             current_price = float(closes[-1])
             
             # Get last valid values
+            ma13_val = float(ma13.iloc[-1]) if not pd.isna(ma13.iloc[-1]) else 0
             ma20_val = float(ma20.iloc[-1]) if not pd.isna(ma20.iloc[-1]) else 0
+            ma21_val = float(ma21.iloc[-1]) if not pd.isna(ma21.iloc[-1]) else 0
             ma50_val = float(ma50.iloc[-1]) if not pd.isna(ma50.iloc[-1]) else 0
             ma200_val = float(ma200.iloc[-1]) if not pd.isna(ma200.iloc[-1]) else 0
             
@@ -345,51 +350,78 @@ def calculate_moving_averages(df: pd.DataFrame) -> Dict:
                 golden_cross = ma50_val > ma200_val
                 
                 # Price position relative to MAs
+                above_ma13 = current_price > ma13_val
                 above_ma20 = current_price > ma20_val
+                above_ma21 = current_price > ma21_val
                 above_ma50 = current_price > ma50_val
                 above_ma200 = current_price > ma200_val
                 
+                # Count how many MAs price is above
+                ma_count_above = sum([above_ma13, above_ma20, above_ma21, above_ma50, above_ma200])
+                
                 # Determine overall trend
-                if above_ma20 and above_ma50 and above_ma200:
+                if ma_count_above >= 4:
                     trend = "Strong Bullish"
-                elif above_ma20 and above_ma50:
+                elif ma_count_above >= 3:
                     trend = "Bullish"
-                elif not above_ma20 and not above_ma50:
+                elif ma_count_above <= 1:
                     trend = "Bearish"
                 else:
                     trend = "Neutral"
                 
+                # Determine MA alignment
+                if ma13_val > ma20_val > ma21_val > ma50_val > ma200_val:
+                    alignment = "Strong Bullish Alignment"
+                elif ma13_val < ma20_val < ma21_val < ma50_val < ma200_val:
+                    alignment = "Strong Bearish Alignment"
+                else:
+                    alignment = "Mixed Alignment"
+                
                 ma_data = {
+                    'MA13': ma13_val,
                     'MA20': ma20_val,
+                    'MA21': ma21_val,
                     'MA50': ma50_val,
                     'MA200': ma200_val,
                     'trend': trend,
                     'golden_cross': "Yes" if golden_cross else "No",
+                    'price_vs_ma13': "Above" if above_ma13 else "Below",
                     'price_vs_ma20': "Above" if above_ma20 else "Below",
+                    'price_vs_ma21': "Above" if above_ma21 else "Below",
                     'price_vs_ma50': "Above" if above_ma50 else "Below",
                     'price_vs_ma200': "Above" if above_ma200 else "Below",
-                    'ma_alignment': "Bullish" if ma20_val > ma50_val > ma200_val else "Bearish" if ma20_val < ma50_val < ma200_val else "Mixed"
+                    'ma_alignment': alignment,
+                    'ma_count_above': ma_count_above
                 }
             else:
                 ma_data = {
+                    'MA13': 0,
                     'MA20': 0,
+                    'MA21': 0,
                     'MA50': 0,
                     'MA200': 0,
                     'trend': "Insufficient data",
                     'golden_cross': "Unknown",
+                    'price_vs_ma13': "Unknown",
                     'price_vs_ma20': "Unknown",
+                    'price_vs_ma21': "Unknown",
                     'price_vs_ma50': "Unknown",
                     'price_vs_ma200': "Unknown",
                     'ma_alignment': "Unknown"
                 }
         else:
+            needed_points = 200 - len(df)
             ma_data = {
+                'MA13': 0,
                 'MA20': 0,
+                'MA21': 0,
                 'MA50': 0,
                 'MA200': 0,
-                'trend': f"Need {200-len(df)} more days for full analysis",
+                'trend': f"Need {needed_points} more points for full analysis",
                 'golden_cross': "Unknown",
+                'price_vs_ma13': "Unknown",
                 'price_vs_ma20': "Unknown",
+                'price_vs_ma21': "Unknown",
                 'price_vs_ma50': "Unknown",
                 'price_vs_ma200': "Unknown",
                 'ma_alignment': "Unknown"
@@ -398,12 +430,16 @@ def calculate_moving_averages(df: pd.DataFrame) -> Dict:
     except Exception as e:
         print(f"Moving average calculation error: {e}")
         ma_data = {
+            'MA13': 0,
             'MA20': 0,
+            'MA21': 0,
             'MA50': 0,
             'MA200': 0,
             'trend': "Calculation error",
             'golden_cross': "Unknown",
+            'price_vs_ma13': "Unknown",
             'price_vs_ma20': "Unknown",
+            'price_vs_ma21': "Unknown",
             'price_vs_ma50': "Unknown",
             'price_vs_ma200': "Unknown",
             'ma_alignment': "Unknown"
@@ -984,24 +1020,7 @@ def get_ai_insight():
         # 6. Perform Technical Analysis on these 50 points
         fib_data = calculate_fibonacci_retracement(analysis_df)
         sr_data = calculate_support_resistance(analysis_df)
-        # FIX: Define patterns variable
         patterns = detect_candlestick_patterns(analysis_df, interval) or ["No patterns detected"]
-        
-        # 7. Fetch News
-        news_items = get_alpha_vantage_news(symbol) or get_mock_news(symbol)
-        news_titles = [item['title'] for item in news_items[:3]]
-
-        news_sentiment = "neutral"
-        sentiment_score = 0
-
-        if news_items:
-            scores = [item.get('sentiment_score', 0) for item in news_items]
-            valid_scores = [s for s in scores if s != 0]
-            if valid_scores:
-                avg_sentiment = sum(valid_scores) / len(valid_scores)
-                sentiment_score = avg_sentiment
-                if avg_sentiment > 0.15: news_sentiment = "bullish"
-                elif avg_sentiment < -0.15: news_sentiment = "bearish"
         
         current_price = float(analysis_df['close'].iloc[-1])
         
@@ -1037,14 +1056,7 @@ def get_ai_insight():
                 "distance": f"{sr_data.get('distance_pct', 0)}%",
                 "strength": sr_data.get('strength', 'Unknown')
             },
-            "patterns_detected": patterns,
-            "news": {
-                "sentiment": news_sentiment,
-                "sentiment_score": round(sentiment_score, 3),
-                "headlines": news_titles,
-                "count": len(news_titles),
-                "source": "Alpha Vantage News Sentiment API"
-            }
+            "patterns_detected": patterns
         }
         # Create comprehensive prompt for AI
         prompt = f"""
@@ -1056,7 +1068,9 @@ def get_ai_insight():
         DATA SOURCE: {technical_summary['data_source'].upper()}
         
         MOVING AVERAGES:
+        - MA13: {technical_summary['moving_averages']['MA13']}
         - MA20: {technical_summary['moving_averages']['MA20']}
+        - MA21: {technical_summary['moving_averages']['MA21']}
         - MA50: {technical_summary['moving_averages']['MA50']}
         - MA200: {technical_summary['moving_averages']['MA200']}
         - Trend: {technical_summary['moving_averages']['trend']}
@@ -1080,28 +1094,21 @@ def get_ai_insight():
         PATTERNS DETECTED:
         {chr(10).join([f"- {pattern}" for pattern in patterns])}
         
-        NEWS SENTIMENT: {technical_summary['news']['sentiment'].upper()} (Score: {technical_summary['news']['sentiment_score']})
-        SENTIMENT SOURCE: {technical_summary['news']['source']}
-        RECENT HEADLINES ({technical_summary['news']['count']}):
-        {chr(10).join([f"- {headline}" for headline in technical_summary['news']['headlines']])}
-        
         Based on ALL technical indicators above, provide a comprehensive analysis including:
         1. Overall trend assessment with confidence level
         2. Significance of Fibonacci retracement level
-        3. Moving average alignment implications
+        3. Moving average alignment implications (focus on 13, 20, 21, 50, 200 MA)
         4. Pattern recognition analysis
         5. Support/resistance breakout potential
-        6. News sentiment impact with quantifiable score
-        7. Risk assessment with specific risk factors
-        8. Clear trading recommendation with entry/exit levels
+        6. Risk assessment with specific risk factors
+        7. Clear trading recommendation with entry/exit levels
         
         Respond in valid JSON format with these exact fields:
         - trend: (string) Overall market trend with confidence
         - patterns: (array of strings) Key technical patterns with explanations
         - fibonacci_analysis: (string) Detailed Fibonacci interpretation
-        - ma_analysis: (string) Moving average analysis with implications
+        - ma_analysis: (string) Moving average analysis with implications (mention 13, 20, 21, 50, 200 MA)
         - support_resistance_analysis: (string) Breakout/breakdown potential
-        - news_impact: (string) How news sentiment affects the analysis
         - risk_assessment: (string) Specific risk factors (Low/Medium/High)
         - verdict: (string) Comprehensive analysis conclusion
         - suggestion: (string) BUY/HOLD/SELL with conviction
@@ -1110,8 +1117,10 @@ def get_ai_insight():
         - key_levels: (object) Important price levels to watch
 
         Additional Rules: 
-        - Summarizze risk assessment up to 15 words response.
+        - Summarize risk assessment up to 15 words response.
+        - Focus on MA13, MA20, MA21, MA50, MA200 in your analysis.
         """
+
 
         # Get AI response
         response = client.chat.completions.create(
