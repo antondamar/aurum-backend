@@ -264,8 +264,10 @@ def sync_historical_data(symbol: str) -> Dict:
         # Update Firebase
         api_symbol = get_api_symbol(symbol)
         asset_ref = db.collection('historical_data').document(api_symbol)
+        monthly_data = aggregate_to_monthly(new_data)
         asset_ref.set({
             "daily": new_data,
+            "monthly": monthly_data,
             "symbol": symbol,
             "last_synced": datetime.now().isoformat(),
             "data_points": len(new_data),
@@ -290,6 +292,30 @@ def sync_historical_data(symbol: str) -> Dict:
         }
 
 # ==================== TECHNICAL ANALYSIS FUNCTIONS ====================
+
+def aggregate_to_monthly(daily_data: List[Dict]) -> List[Dict]:
+    """Convert daily OHLC data to monthly"""
+    monthly_data = {}
+    for day in daily_data:
+        date = pd.to_datetime(day['date'])
+        month_key = f"{date.year}-{date.month:02d}"
+        
+        if month_key not in monthly_data:
+            monthly_data[month_key] = {
+                'date': f"{date.year}-{date.month:02d}-01",
+                'open': day['open'],
+                'high': day['high'],
+                'low': day['low'],
+                'close': day['close'],
+                'volume': day['volume']
+            }
+        else:
+            monthly_data[month_key]['high'] = max(monthly_data[month_key]['high'], day['high'])
+            monthly_data[month_key]['low'] = min(monthly_data[month_key]['low'], day['low'])
+            monthly_data[month_key]['close'] = day['close']
+            monthly_data[month_key]['volume'] += day['volume']
+    
+    return sorted(monthly_data.values(), key=lambda x: x['date'])
 
 def calculate_moving_averages(df: pd.DataFrame) -> Dict:
     """Calculate various moving averages with proper validation"""
@@ -505,16 +531,34 @@ def get_fibonacci_description(level1: str, level2: str) -> str:
     }
     return zones.get((level1, level2), "Standard Fibonacci retracement level")
 
-def detect_candlestick_patterns(df: pd.DataFrame) -> List[str]:
-    """Detect common candlestick patterns without TA-Lib"""
+def detect_candlestick_patterns(df: pd.DataFrame, interval: str = 'daily') -> List[str]:
+    """Detect common candlestick patterns without TA-Lib, with interval-specific thresholds"""
     patterns = []
     
+    # Set thresholds based on interval
+    if interval == 'monthly':
+        # Monthly candles have larger price ranges, need more lenient thresholds
+        body_ratio = 0.15      # For Doji: body < 15% of range (vs 10% for daily)
+        shadow_ratio = 1.5     # For Hammer/Shooting Star: shadow > 1.5x body (vs 2x for daily)
+        small_body_ratio = 0.25 # For Morning/Evening Star middle candle (vs 0.3 for daily)
+        engulfing_ratio = 1.2   # For Harami: body_day1 > body_day2 * 1.2 (vs 2 for daily)
+        trend_lookback = 8      # Look back 8 months for trend (vs 5 days for daily)
+    else:  # daily
+        body_ratio = 0.1       # Daily thresholds
+        shadow_ratio = 2.0
+        small_body_ratio = 0.3
+        engulfing_ratio = 2.0
+        trend_lookback = 5
+    
     try:
-        if len(df) < 40:
-            return ["Insufficient data for pattern recognition"]
+        # Adjust minimum data points based on interval
+        min_data_points = 20 if interval == 'monthly' else 40
         
-        # Get recent data (last 40 days for pattern detection)
-        recent_data = df.tail(40)
+        if len(df) < min_data_points:
+            return [f"Insufficient data ({len(df)} {interval} points) for pattern recognition"]
+        
+        # Get recent data
+        recent_data = df.tail(min_data_points)
         
         # Extract OHLC data
         if 'open' in recent_data.columns and 'high' in recent_data.columns and 'low' in recent_data.columns:
@@ -529,147 +573,177 @@ def detect_candlestick_patterns(df: pd.DataFrame) -> List[str]:
             highs = closes * 1.01
             lows = closes * 0.99
         
-        # Get last 5 days for pattern detection
+        # Get last index
         last_idx = len(closes) - 1
         
-        if last_idx >= 4:  # Need at least 5 days
-            # Bullish Engulfing Pattern
-            if (closes[last_idx-1] < opens[last_idx-1] and  # Previous day is bearish
-                closes[last_idx] > opens[last_idx] and      # Current day is bullish
-                opens[last_idx] < closes[last_idx-1] and    # Open below previous close
-                closes[last_idx] > opens[last_idx-1]):      # Close above previous open
-                patterns.append("Bullish Engulfing Pattern")
-            
-            # Bearish Engulfing Pattern
-            elif (closes[last_idx-1] > opens[last_idx-1] and  # Previous day is bullish
-                  closes[last_idx] < opens[last_idx] and      # Current day is bearish
-                  opens[last_idx] > closes[last_idx-1] and    # Open above previous close
-                  closes[last_idx] < opens[last_idx-1]):      # Close below previous open
-                patterns.append("Bearish Engulfing Pattern")
-            
-            # Hammer
+        # Single candle patterns (need at least 1 recent candle)
+        if last_idx >= 0:
+            # Calculate candle metrics
             body = abs(closes[last_idx] - opens[last_idx])
+            candle_range = highs[last_idx] - lows[last_idx]
             lower_shadow = min(opens[last_idx], closes[last_idx]) - lows[last_idx]
             upper_shadow = highs[last_idx] - max(opens[last_idx], closes[last_idx])
             
-            if (lower_shadow > body * 2 and  # Long lower shadow
-                upper_shadow < body * 0.1 and  # Small or no upper shadow
-                closes[last_idx] > opens[last_idx]):  # Bullish close
-                patterns.append("Bullish Hammer")
+            # Hammer (long lower shadow, small upper shadow, bullish close)
+            if (lower_shadow > body * shadow_ratio and
+                upper_shadow < body * 0.1 and
+                closes[last_idx] > opens[last_idx] and
+                candle_range > 0):  # Ensure non-zero range
+                patterns.append(f"Bullish Hammer ({interval})")
             
-            # Hanging Man (similar to hammer but after uptrend)
-            if (lower_shadow > body * 2 and  # Long lower shadow
-                upper_shadow < body * 0.1 and  # Small or no upper shadow
-                closes[last_idx] < opens[last_idx] and  # Bearish close
-                closes[last_idx-5:last_idx].mean() < closes[last_idx]):  # In uptrend
-                patterns.append("Bearish Hanging Man")
+            # Hanging Man (similar to hammer but bearish close, in uptrend)
+            if (lower_shadow > body * shadow_ratio and
+                upper_shadow < body * 0.1 and
+                closes[last_idx] < opens[last_idx] and
+                last_idx >= trend_lookback and
+                closes[last_idx-trend_lookback:last_idx].mean() < closes[last_idx]):  # In uptrend
+                patterns.append(f"Bearish Hanging Man ({interval})")
             
-            # Doji
-            if body < (highs[last_idx] - lows[last_idx]) * 0.1:  # Very small body
-                patterns.append("Doji Pattern")
+            # Doji (very small body)
+            if candle_range > 0 and body < candle_range * body_ratio:
+                patterns.append(f"Doji Pattern ({interval})")
             
-            # Shooting Star
-            if (upper_shadow > body * 2 and  # Long upper shadow
-                lower_shadow < body * 0.1 and  # Small or no lower shadow
-                closes[last_idx] < opens[last_idx]):  # Bearish close
-                patterns.append("Bearish Shooting Star")
+            # Shooting Star (long upper shadow, small lower shadow, bearish close)
+            if (upper_shadow > body * shadow_ratio and
+                lower_shadow < body * 0.1 and
+                closes[last_idx] < opens[last_idx] and
+                candle_range > 0):
+                patterns.append(f"Bearish Shooting Star ({interval})")
             
-            # Inverted Hammer
-            if (upper_shadow > body * 2 and  # Long upper shadow
-                lower_shadow < body * 0.1 and  # Small or no lower shadow
-                closes[last_idx] > opens[last_idx]):  # Bullish close
-                patterns.append("Bullish Inverted Hammer")
+            # Inverted Hammer (long upper shadow, small lower shadow, bullish close)
+            if (upper_shadow > body * shadow_ratio and
+                lower_shadow < body * 0.1 and
+                closes[last_idx] > opens[last_idx] and
+                candle_range > 0):
+                patterns.append(f"Bullish Inverted Hammer ({interval})")
         
-        # Multi-day patterns (need at least 3 days)
-        if last_idx >= 2:
-            # Morning Star (3-day pattern)
-            if (closes[last_idx-2] < opens[last_idx-2] and  # Day 1: bearish
-                abs(closes[last_idx-1] - opens[last_idx-1]) < (highs[last_idx-1] - lows[last_idx-1]) * 0.3 and  # Day 2: small body
-                closes[last_idx] > opens[last_idx] and  # Day 3: bullish
-                closes[last_idx] > (opens[last_idx-2] + closes[last_idx-2]) / 2):  # Closes above midpoint of Day 1
-                patterns.append("Bullish Morning Star")
+        # Two-candle patterns (need at least 2 candles)
+        if last_idx >= 1:
+            # Bullish Engulfing Pattern
+            if (closes[last_idx-1] < opens[last_idx-1] and  # Previous is bearish
+                closes[last_idx] > opens[last_idx] and      # Current is bullish
+                opens[last_idx] < closes[last_idx-1] and    # Open below previous close
+                closes[last_idx] > opens[last_idx-1]):      # Close above previous open
+                patterns.append(f"Bullish Engulfing Pattern ({interval})")
             
-            # Evening Star (3-day pattern)
-            if (closes[last_idx-2] > opens[last_idx-2] and  # Day 1: bullish
-                abs(closes[last_idx-1] - opens[last_idx-1]) < (highs[last_idx-1] - lows[last_idx-1]) * 0.3 and  # Day 2: small body
-                closes[last_idx] < opens[last_idx] and  # Day 3: bearish
-                closes[last_idx] < (opens[last_idx-2] + closes[last_idx-2]) / 2):  # Closes below midpoint of Day 1
-                patterns.append("Bearish Evening Star")
+            # Bearish Engulfing Pattern
+            elif (closes[last_idx-1] > opens[last_idx-1] and  # Previous is bullish
+                  closes[last_idx] < opens[last_idx] and      # Current is bearish
+                  opens[last_idx] > closes[last_idx-1] and    # Open above previous close
+                  closes[last_idx] < opens[last_idx-1]):      # Close below previous open
+                patterns.append(f"Bearish Engulfing Pattern ({interval})")
             
-            # Three White Soldiers (3 consecutive bullish candles)
-            if all(closes[i] > opens[i] for i in range(last_idx-2, last_idx+1)):
-                if (closes[last_idx-2] > opens[last_idx-2] and
-                    closes[last_idx-1] > closes[last_idx-2] and
-                    closes[last_idx] > closes[last_idx-1]):
-                    patterns.append("Bullish Three White Soldiers")
-            
-            # Three Black Crows (3 consecutive bearish candles)
-            if all(closes[i] < opens[i] for i in range(last_idx-2, last_idx+1)):
-                if (closes[last_idx-2] < opens[last_idx-2] and
-                    closes[last_idx-1] < closes[last_idx-2] and
-                    closes[last_idx] < closes[last_idx-1]):
-                    patterns.append("Bearish Three Black Crows")
-            
-            # Harami Pattern (2-day)
+            # Harami Pattern
             body_day1 = abs(closes[last_idx-1] - opens[last_idx-1])
             body_day2 = abs(closes[last_idx] - opens[last_idx])
             
-            if body_day1 > body_day2 * 2:  # Day 1 has much larger body
+            if body_day1 > body_day2 * engulfing_ratio:  # Day 1 has significantly larger body
                 # Bullish Harami
                 if (closes[last_idx-1] < opens[last_idx-1] and  # Day 1 bearish
                     closes[last_idx] > opens[last_idx] and      # Day 2 bullish
                     opens[last_idx] > closes[last_idx-1] and    # Day 2 open above Day 1 close
                     closes[last_idx] < opens[last_idx-1]):      # Day 2 close below Day 1 open
-                    patterns.append("Bullish Harami Pattern")
+                    patterns.append(f"Bullish Harami Pattern ({interval})")
                 # Bearish Harami
                 elif (closes[last_idx-1] > opens[last_idx-1] and  # Day 1 bullish
                       closes[last_idx] < opens[last_idx] and      # Day 2 bearish
                       opens[last_idx] < closes[last_idx-1] and    # Day 2 open below Day 1 close
                       closes[last_idx] > opens[last_idx-1]):      # Day 2 close above Day 1 open
-                    patterns.append("Bearish Harami Pattern")
+                    patterns.append(f"Bearish Harami Pattern ({interval})")
             
-            # Piercing Pattern (2-day)
+            # Piercing Pattern
             if (closes[last_idx-1] < opens[last_idx-1] and  # Day 1 bearish
                 closes[last_idx] > opens[last_idx] and      # Day 2 bullish
                 opens[last_idx] < closes[last_idx-1] and    # Day 2 open below Day 1 close
                 closes[last_idx] > (opens[last_idx-1] + closes[last_idx-1]) / 2):  # Closes above midpoint
-                patterns.append("Bullish Piercing Pattern")
+                patterns.append(f"Bullish Piercing Pattern ({interval})")
             
-            # Dark Cloud Cover (2-day)
+            # Dark Cloud Cover
             if (closes[last_idx-1] > opens[last_idx-1] and  # Day 1 bullish
                 closes[last_idx] < opens[last_idx] and      # Day 2 bearish
                 opens[last_idx] > closes[last_idx-1] and    # Day 2 open above Day 1 close
                 closes[last_idx] < (opens[last_idx-1] + closes[last_idx-1]) / 2):  # Closes below midpoint
-                patterns.append("Bearish Dark Cloud Cover")
+                patterns.append(f"Bearish Dark Cloud Cover ({interval})")
         
-        # Add chart patterns
-        patterns.extend(detect_chart_patterns(df))
+        # Three-candle patterns (need at least 3 candles)
+        if last_idx >= 2:
+            middle_candle_range = highs[last_idx-1] - lows[last_idx-1]
+            
+            # Morning Star (3-day bullish reversal)
+            if (closes[last_idx-2] < opens[last_idx-2] and  # Day 1: bearish
+                middle_candle_range > 0 and
+                abs(closes[last_idx-1] - opens[last_idx-1]) < middle_candle_range * small_body_ratio and  # Day 2: small body
+                closes[last_idx] > opens[last_idx] and  # Day 3: bullish
+                closes[last_idx] > (opens[last_idx-2] + closes[last_idx-2]) / 2):  # Closes above midpoint of Day 1
+                patterns.append(f"Bullish Morning Star ({interval})")
+            
+            # Evening Star (3-day bearish reversal)
+            if (closes[last_idx-2] > opens[last_idx-2] and  # Day 1: bullish
+                middle_candle_range > 0 and
+                abs(closes[last_idx-1] - opens[last_idx-1]) < middle_candle_range * small_body_ratio and  # Day 2: small body
+                closes[last_idx] < opens[last_idx] and  # Day 3: bearish
+                closes[last_idx] < (opens[last_idx-2] + closes[last_idx-2]) / 2):  # Closes below midpoint of Day 1
+                patterns.append(f"Bearish Evening Star ({interval})")
+            
+            # Three White Soldiers (3 consecutive bullish candles with higher closes)
+            if all(closes[i] > opens[i] for i in range(last_idx-2, last_idx+1)):
+                if (closes[last_idx-2] > opens[last_idx-2] and
+                    closes[last_idx-1] > closes[last_idx-2] and
+                    closes[last_idx] > closes[last_idx-1]):
+                    patterns.append(f"Bullish Three White Soldiers ({interval})")
+            
+            # Three Black Crows (3 consecutive bearish candles with lower closes)
+            if all(closes[i] < opens[i] for i in range(last_idx-2, last_idx+1)):
+                if (closes[last_idx-2] < opens[last_idx-2] and
+                    closes[last_idx-1] < closes[last_idx-2] and
+                    closes[last_idx] < closes[last_idx-1]):
+                    patterns.append(f"Bearish Three Black Crows ({interval})")
         
-        return patterns if patterns else ["No strong candlestick patterns detected"]
+        # Add chart patterns with interval awareness
+        patterns.extend(detect_chart_patterns(df, interval))
+        
+        return patterns if patterns else [f"No strong {interval} candlestick patterns detected"]
         
     except Exception as e:
-        print(f"Pattern detection error: {e}")
-        return ["Pattern recognition unavailable"]
+        print(f"Pattern detection error for {interval}: {e}")
+        return [f"Pattern recognition unavailable for {interval}"]
 
-def detect_chart_patterns(df: pd.DataFrame) -> List[str]:
-    """Detect chart patterns"""
+def detect_chart_patterns(df: pd.DataFrame, interval: str = 'daily') -> List[str]:
+    """Detect chart patterns with interval awareness"""
     patterns = []
     
     try:
-        if len(df) < 20:
+        min_points = 10 if interval == 'monthly' else 20
+        
+        if len(df) < min_points:
             return []
         
         closes = df['close'].values
         
+        # Adjust parameters based on interval
+        if interval == 'monthly':
+            wedge_window = 12  # 12 months for wedge detection
+            reversal_threshold = 0.03  # 3% for double top/bottom
+        else:
+            wedge_window = 20  # 20 days for wedge detection
+            reversal_threshold = 0.02  # 2% for double top/bottom
+        
         # Detect wedges
-        if len(df) >= 20:
+        if len(df) >= wedge_window:
             # Simple wedge detection (price converging)
-            recent_closes = closes[-20:]
-            high_trend = np.polyfit(range(20), df['high'].values[-20:] if 'high' in df.columns else recent_closes, 1)[0]
-            low_trend = np.polyfit(range(20), df['low'].values[-20:] if 'low' in df.columns else recent_closes * 0.98, 1)[0]
+            recent_closes = closes[-wedge_window:]
+            high_trend = np.polyfit(range(wedge_window), 
+                                   df['high'].values[-wedge_window:] if 'high' in df.columns else recent_closes, 
+                                   1)[0]
+            low_trend = np.polyfit(range(wedge_window), 
+                                  df['low'].values[-wedge_window:] if 'low' in df.columns else recent_closes * 0.98, 
+                                  1)[0]
             
             if high_trend < 0 and low_trend > 0:  # Converging
-                patterns.append("Rising Wedge" if np.mean(recent_closes[-5:]) > np.mean(recent_closes[:5]) else "Falling Wedge")
+                if np.mean(recent_closes[-5:]) > np.mean(recent_closes[:5]):
+                    patterns.append(f"Rising Wedge ({interval})")
+                else:
+                    patterns.append(f"Falling Wedge ({interval})")
         
         # Detect double top/bottom
         if len(df) >= 30:
@@ -683,15 +757,26 @@ def detect_chart_patterns(df: pd.DataFrame) -> List[str]:
                 elif last_30[i] < last_30[i-1] and last_30[i] < last_30[i+1]:
                     troughs.append(last_30[i])
             
-            if len(peaks) >= 2 and abs(peaks[-1] - peaks[-2]) / peaks[-1] < 0.02:
-                patterns.append("Double Top" if peaks[-1] < peaks[-2] else "Double Bottom Reversal")
-            if len(troughs) >= 2 and abs(troughs[-1] - troughs[-2]) / troughs[-1] < 0.02:
-                patterns.append("Double Bottom" if troughs[-1] > troughs[-2] else "Double Top Reversal")
+            if len(peaks) >= 2:
+                diff_pct = abs(peaks[-1] - peaks[-2]) / peaks[-1]
+                if diff_pct < reversal_threshold:
+                    if peaks[-1] < peaks[-2]:
+                        patterns.append(f"Double Top ({interval})")
+                    else:
+                        patterns.append(f"Double Bottom Reversal ({interval})")
+            
+            if len(troughs) >= 2:
+                diff_pct = abs(troughs[-1] - troughs[-2]) / troughs[-1]
+                if diff_pct < reversal_threshold:
+                    if troughs[-1] > troughs[-2]:
+                        patterns.append(f"Double Bottom ({interval})")
+                    else:
+                        patterns.append(f"Double Top Reversal ({interval})")
         
         return patterns
         
     except Exception as e:
-        print(f"Chart pattern detection error: {e}")
+        print(f"Chart pattern detection error for {interval}: {e}")
         return []
 
 def calculate_support_resistance(df: pd.DataFrame) -> Dict:
@@ -760,6 +845,38 @@ def downsample_to_50_points(df: pd.DataFrame) -> pd.DataFrame:
     downsampled = df.iloc[::step].tail(50) 
     return downsampled
 
+def get_monthly_data(symbol: str) -> List[Dict]:
+    """Get or calculate monthly data from daily data"""
+    api_symbol = get_api_symbol(symbol)
+    asset_ref = db.collection('historical_data').document(api_symbol)
+    doc = asset_ref.get()
+    
+    if not doc.exists:
+        return []
+    
+    data = doc.to_dict()
+    daily_data = data.get('daily', [])
+    
+    if not daily_data:
+        return []
+    
+    # Aggregate to monthly
+    df = pd.DataFrame(daily_data)
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # Resample to monthly
+    monthly_df = df.set_index('date').resample('M').agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }).reset_index()
+    
+    monthly_df['date'] = monthly_df['date'].dt.strftime('%Y-%m-%d')
+    
+    return monthly_df.to_dict('records')
+
 # ==================== ENDPOINTS ====================
 
 @app.route('/get-historical-data', methods=['GET'])
@@ -827,10 +944,15 @@ def get_ai_insight():
         df = pd.DataFrame(data_pool)
         
         # 3. Filter by timeframe
-        df['date'] = pd.to_datetime(df['date'])
-        years_to_keep = int(timeframe.replace('y', ''))
-        cutoff_date = datetime.now() - timedelta(days=years_to_keep * 365)
-        df = df[df['date'] >= cutoff_date]
+        if interval == 'monthly':
+            # For monthly, filter by number of months
+            months_to_keep = int(timeframe.replace('y', '')) * 12
+            df = df.tail(months_to_keep)  # Keep last N months
+        else:
+            # For daily, use your current day-based filtering
+            years_to_keep = int(timeframe.replace('y', ''))
+            cutoff_date = datetime.now() - timedelta(days=years_to_keep * 365)
+            df = df[df['date'] >= cutoff_date]
 
         # 4. Calculate Moving Averages on FULL timeframe (Fixes MA=0 issue)
         ma_data = calculate_moving_averages(df)
@@ -842,7 +964,7 @@ def get_ai_insight():
         fib_data = calculate_fibonacci_retracement(analysis_df)
         sr_data = calculate_support_resistance(analysis_df)
         # FIX: Define patterns variable
-        patterns = detect_candlestick_patterns(analysis_df) or ["No patterns detected"]
+        patterns = detect_candlestick_patterns(analysis_df, interval) or ["No patterns detected"]
         
         # 7. Fetch News
         news_items = get_alpha_vantage_news(symbol) or get_mock_news(symbol)
