@@ -1259,6 +1259,45 @@ def get_daily_price(symbol: str) -> Optional[float]:
         print(f"Error getting daily price for {symbol}: {e}")
         return None
 
+@app.route('/get-last-sync/<symbol>', methods=['GET'])
+def get_last_sync(symbol: str):
+    """Get the last synced date for a symbol"""
+    try:
+        api_symbol = get_api_symbol(symbol)
+        doc_ref = db.collection('historical_data').document(api_symbol)
+        doc = doc_ref.get()
+        
+        if not doc.exists:
+            return jsonify({
+                'symbol': symbol,
+                'last_date': None,
+                'message': 'No data found'
+            }), 404
+        
+        data = doc.to_dict()
+        daily_data = data.get('daily', [])
+        
+        if not daily_data:
+            return jsonify({
+                'symbol': symbol,
+                'last_date': None,
+                'message': 'No daily data'
+            }), 404
+        
+        # Get the most recent date
+        dates = [item['date'] for item in daily_data]
+        last_date = max(dates)
+        
+        return jsonify({
+            'symbol': symbol,
+            'last_date': last_date,
+            'data_points': len(daily_data),
+            'last_synced': data.get('last_synced', 'Unknown')
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/get-price/<symbol>', methods=['GET'])
 def get_price_endpoint(symbol: str):
     """Get price - tries daily cache first, then real-time"""
