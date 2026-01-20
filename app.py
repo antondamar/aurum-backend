@@ -1201,6 +1201,70 @@ def local_upload():
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+# ==================== DAILY PRICE CACHE FUNCTIONS ====================
+
+def get_daily_price(symbol: str) -> Optional[float]:
+    """Get today's price from daily cache (fetched by cron)"""
+    try:
+        doc_ref = db.collection('daily_prices').document(symbol)
+        doc = doc_ref.get()
+        
+        if doc.exists:
+            data = doc.to_dict()
+            today = datetime.now().strftime('%Y-%m-%d')
+            
+            # Check if we have today's price
+            prices = data.get('prices', [])
+            for price_data in prices:
+                if price_data.get('date') == today:
+                    return float(price_data['price'])
+            
+            # If not today, return most recent
+            if prices:
+                return float(prices[-1]['price'])
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error getting daily price for {symbol}: {e}")
+        return None
+
+@app.route('/get-price/<symbol>', methods=['GET'])
+def get_price_endpoint(symbol: str):
+    """Get price - tries daily cache first, then real-time"""
+    try:
+        # Try daily cache first
+        cached_price = get_daily_price(symbol)
+        
+        if cached_price:
+            return jsonify({
+                'symbol': symbol,
+                'price': cached_price,
+                'source': 'daily_cache',
+                'timestamp': datetime.now().isoformat(),
+                'cached': True
+            })
+        
+        # Fallback to real-time
+        realtime_price = get_realtime_price(symbol)
+        
+        if realtime_price:
+            return jsonify({
+                'symbol': symbol,
+                'price': realtime_price,
+                'source': 'realtime',
+                'timestamp': datetime.now().isoformat(),
+                'cached': False
+            })
+        
+        return jsonify({
+            'error': f'Could not fetch price for {symbol}',
+            'symbol': symbol
+        }), 404
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
