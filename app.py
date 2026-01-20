@@ -138,42 +138,71 @@ def get_yfinance_historical(symbol: str, period: str = "2y") -> Optional[pd.Data
 # ==================== FETCH REAL-TIME PRICE ====================
 
 def get_realtime_price(symbol: str) -> Optional[float]:
-    """Fetch real-time price using yfinance (matches priceService.js logic)"""
+    """Fetch real-time price using Alpha Vantage first, then yfinance fallback"""
+    
+    # METHOD 1: Try Alpha Vantage FIRST (if API key is available)
+    if ALPHA_VANTAGE_API_KEY:
+        try:
+            print(f"🔍 Trying Alpha Vantage for {symbol}...")
+            url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
+            response = session.get(url, timeout=10)
+            data = response.json()
+            
+            if 'Global Quote' in data and '05. price' in data['Global Quote']:
+                price = float(data['Global Quote']['05. price'])
+                print(f"✅ Alpha Vantage price for {symbol}: {price}")
+                return price
+            else:
+                print(f"⚠️ Alpha Vantage no data for {symbol}: {data}")
+        except Exception as e:
+            print(f"⚠️ Alpha Vantage error for {symbol}: {e}")
+    else:
+        print("⚠️ No Alpha Vantage API key found")
+    
+    # METHOD 2: Fallback to yfinance
     try:
+        print(f"🔍 Trying yfinance for {symbol}...")
         api_symbol = get_api_symbol(symbol)
         ticker = yf.Ticker(api_symbol, session=session)
         
-        # Try to get current price from multiple sources
+        # Try multiple methods with rate limit handling
         try:
             # Method 1: fast_info (fastest)
             if hasattr(ticker, 'fast_info'):
                 price = ticker.fast_info.get('last_price') or ticker.fast_info.get('regularMarketPrice')
                 if price and price > 0:
+                    print(f"✅ yfinance fast_info price for {symbol}: {price}")
                     return float(price)
-        except:
-            pass
+        except Exception as e:
+            print(f"⚠️ yfinance fast_info failed: {e}")
         
         try:
             # Method 2: info (more reliable but slower)
+            time.sleep(0.5)  # Small delay to avoid rate limits
             info = ticker.info
             price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
             if price and price > 0:
+                print(f"✅ yfinance info price for {symbol}: {price}")
                 return float(price)
-        except:
-            pass
+        except Exception as e:
+            print(f"⚠️ yfinance info failed: {e}")
         
         try:
             # Method 3: history last close (fallback)
+            time.sleep(0.5)  # Small delay to avoid rate limits
             hist = ticker.history(period="1d", interval="1m")
             if not hist.empty:
-                return float(hist['Close'].iloc[-1])
-        except:
-            pass
+                price = float(hist['Close'].iloc[-1])
+                print(f"✅ yfinance history price for {symbol}: {price}")
+                return price
+        except Exception as e:
+            print(f"⚠️ yfinance history failed: {e}")
         
+        print(f"❌ All yfinance methods failed for {symbol}")
         return None
         
     except Exception as e:
-        print(f"Real-time price fetch error for {symbol}: {e}")
+        print(f"❌ yfinance completely failed for {symbol}: {e}")
         return None
 
 # ==================== SYNC FUNCTION ====================
