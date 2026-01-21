@@ -1333,6 +1333,62 @@ def get_price_endpoint(symbol: str):
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    
+# app.py - Add this new endpoint
+
+@app.route('/analyze-risk', methods=['POST'])
+def analyze_risk():
+    try:
+        data = request.get_json()
+        answers = data.get('answers', {})
+        portfolio = data.get('portfolio', [])
+        
+        # 1. Format user data for the prompt
+        quiz_summary = "\n".join([f"- {q}: {a}" for q, a in answers.items()])
+        
+        portfolio_summary = "User currently has no assets."
+        if portfolio:
+            portfolio_summary = "\n".join([
+                f"- {p['name']}: {len(p['assets'])} assets, Total Value: ${sum(a['value'] for a in p['assets']):,.2f}"
+                for p in portfolio
+            ])
+
+        # 2. Build the AI Prompt
+        prompt = f"""
+        Act as a professional Wealth Manager. Analyze this user's risk profile and portfolio.
+        
+        USER PROFILE DATA:
+        {quiz_summary}
+        
+        CURRENT PORTFOLIO STRUCTURE:
+        {portfolio_summary}
+        
+        TASK:
+        1. Assess their Risk Category (Conservative, Moderate, or Aggressive).
+        2. Compare their current portfolio to their risk profile.
+        3. Suggest a target asset allocation (e.g., % Stocks, % Crypto, % Cash).
+        4. Provide 3 actionable steps to align their portfolio with their risk tolerance.
+
+        CONSTRAINTS:
+        - Be objective and professional.
+        - Your 'verdict' must be under 200 words.
+        - Respond ONLY in valid JSON format.
+        """
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a financial risk expert. Respond in JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"}
+        )
+
+        return jsonify(json.loads(response.choices[0].message.content))
+
+    except Exception as e:
+        print(f"Risk analysis error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
