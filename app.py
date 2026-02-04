@@ -25,6 +25,19 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+CRYPTO_MAPPINGS = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "BNB": "BNB-USD",
+    "SOL": "SOL-USD",
+    "ADA": "ADA-USD",
+    "XRP": "XRP-USD",
+    "DOGE": "DOGE-USD",
+    "DOT": "DOT-USD",
+    "LINK": "LINK-USD",
+    "LTC": "LTC-USD",
+}
+
 # ==================== FETCHERS (The New Standard) ====================
 
 def fetch_us_stock(symbol):
@@ -48,26 +61,28 @@ def fetch_us_stock(symbol):
         return 0
 
 def fetch_indo_stock(symbol):
-    """
-    Fetches the latest close price for Indonesian stocks using yfinance.
-    Example symbol: 'BBCA.JK'
-    """
     try:
-        # Ensure the symbol has the .JK suffix for Indonesian stocks
-        ticker_sym = symbol if symbol.endswith('.JK') else f"{symbol}.JK"
+        # 1. Ensure suffix is exactly .JK (Uppercase)
+        ticker_sym = symbol.upper()
+        if not ticker_sym.endswith('.JK'):
+            ticker_sym = f"{ticker_sym}.JK"
+            
         stock = yf.Ticker(ticker_sym)
         
-        # fast_info is efficient for just the current price
-        price = stock.fast_info.last_price
+        # 2. Try history first (more reliable for IDX than fast_info)
+        # Fetching '5d' ensures we get data even if it's a weekend or holiday
+        hist = stock.history(period="5d")
         
-        if price is None or price == 0:
-            # Fallback to history if fast_info fails
-            hist = stock.history(period="1d")
-            price = hist['Close'].iloc[-1] if not hist.empty else 0
+        if not hist.empty:
+            price = hist['Close'].iloc[-1]
+            return float(price)
             
-        return float(price)
+        # 3. Last resort: fast_info (if history failed)
+        price = stock.fast_info.last_price
+        return float(price) if price else 0
+        
     except Exception as e:
-        print(f"yfinance error for {symbol}: {e}")
+        print(f"❌ yfinance error for {symbol}: {e}")
         return 0
 
 def fetch_crypto(coingecko_id):
@@ -92,43 +107,203 @@ def get_realtime_price(symbol):
         return fetch_us_stock(symbol)
     return None
 
-
-# ==================== AUTOMATION (Midnight Sync) ====================
+# ==================== UNIFIED AUTOMATION (Midnight Sync for ALL Assets) ====================
 
 def daily_sync_job():
-    """Triggered every midnight to cache prices and rates in Firebase."""
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    print(f"🚀 Syncing for {today_str}...")
+    """
+    Triggered every midnight to:
+    1. Update exchange rates
+    2. Fetch OHLC data for ALL assets (stocks + crypto)
+    3. Append to historical_data collection (no duplicates)
+    4. Update daily_prices cache
     
-    # 1. Exchange Rates
-    rates_res = requests.get("https://open.er-api.com/v6/latest/USD").json()
-    if rates_res.get('rates'):
-        db.collection('exchange_rates').document(today_str).set(rates_res['rates'])
+    FIREBASE STRUCTURE:
+    - Crypto: "BTC-USD", "ETH-USD" (with hyphen)
+    - US Stocks: "MSFT", "AAPL" (plain symbol)
+    - Indo Stocks: "BBCA.JK", "BMRI.JK" (with dot)
+    """
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    print(f"🚀 Daily Sync Job Started: {today_str}")
+    print("=" * 60)
+    
+    # ===== 1. Exchange Rates =====
+    try:
+        rates_res = requests.get("https://open.er-api.com/v6/latest/USD").json()
+        if rates_res.get('rates'):
+            db.collection('exchange_rates').document(today_str).set(rates_res['rates'])
+            print("✅ Exchange rates updated")
+    except Exception as e:
+        print(f"⚠️  Exchange rates failed: {e}")
 
-    # 2. Daily Price Cache
-    # Suggestion: Fetch all unique symbols from your 'historical_data' collection
+    # ===== 2. Get all assets from historical_data =====
     assets = db.collection('historical_data').stream()
+    
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+    
     for asset in assets:
-        sym = asset.id 
-        price = 0
+        sym = asset.id  # e.g., "AAPL", "BBCA.JK", "BTC-USD"
+        asset_data = asset.to_dict()
+        existing_daily = asset_data.get('daily', [])
         
-        # yfinance logic
-        if ".JK" in sym or sym.isupper(): # simplistic check for stocks
-            if ".JK" in sym:
-                price = fetch_indo_stock(sym)
-            else:
-                price = fetch_us_stock(sym)
-
-        if price > 0:
+        # Check if we already have yesterday's data
+        existing_dates = {item['date'] for item in existing_daily}
+        
+        if yesterday in existing_dates:
+            print(f"⏭️  {sym}: Already synced")
+            skip_count += 1
+            continue
+        
+        print(f"📊 Fetching {sym}...")
+        
+        # ===== 3. Determine asset type and fetch OHLC =====
+        ohlc_data = None
+        
+        # CRYPTO: Contains hyphen with USD (e.g., "BTC-USD", "ETH-USD")
+        if "-USD" in sym or "-USDT" in sym:
+            ohlc_data = fetch_crypto_ohlc(sym, yesterday)
+        
+        # INDONESIAN STOCK: Contains ".JK" (e.g., "BBCA.JK", "BMRI.JK")
+        elif ".JK" in sym:
+            ohlc_data = fetch_indo_ohlc(sym, yesterday)
+        
+        # US STOCK: Plain uppercase letters (e.g., "AAPL", "MSFT")
+        elif sym.isalpha() and sym.isupper():
+            ohlc_data = fetch_us_ohlc(sym, yesterday)
+        
+        else:
+            print(f"  ⚠️  Unknown symbol format: {sym}")
+            fail_count += 1
+            continue
+        
+        # ===== 4. Update Firebase if we got valid data =====
+        if ohlc_data and ohlc_data['close'] > 0:
+            existing_daily.append(ohlc_data)
+            existing_daily.sort(key=lambda x: x['date'])
+            
+            # Update historical_data collection
+            db.collection('historical_data').document(sym).update({
+                'daily': existing_daily,
+                'last_synced': datetime.now().isoformat()
+            })
+            
+            # Update daily_prices cache
             db.collection('daily_prices').document(sym).set({
-                "price": price,
-                "date": today_str,
+                "price": ohlc_data['close'],
+                "date": yesterday,
                 "timestamp": datetime.now().isoformat()
             })
+            
+            print(f"  ✅ Updated with {yesterday} data (Close: ${ohlc_data['close']:,.2f})")
+            success_count += 1
+        else:
+            print(f"  ⚠️  No data available")
+            fail_count += 1
+    
+    # ===== 5. Summary =====
+    print("=" * 60)
+    print(f"🎯 Sync Complete!")
+    print(f"   ✅ Updated: {success_count}")
+    print(f"   ⏭️  Skipped: {skip_count}")
+    print(f"   ⚠️  Failed: {fail_count}")
+    print("=" * 60)
 
+
+def fetch_us_ohlc(symbol, date_str):
+    """
+    Fetch OHLC data for US stocks from Massive API (Polygon alternative)
+    Returns yesterday's bar data
+    """
+    url = f"https://api.massive.com/v2/aggs/ticker/{symbol}/prev?adjusted=true"
+    headers = {"Authorization": f"Bearer {POLYGON_KEY}"}
+    
+    try:
+        res = requests.get(url, headers=headers, timeout=10).json()
+        if res.get('status') == 'OK' and 'results' in res:
+            bar = res['results'][0]
+            return {
+                'date': date_str,
+                'open': float(bar['o']),
+                'high': float(bar['h']),
+                'low': float(bar['l']),
+                'close': float(bar['c']),
+                'volume': int(bar['v'])
+            }
+    except Exception as e:
+        print(f"    Error fetching US OHLC for {symbol}: {e}")
+    
+    return None
+
+
+def fetch_indo_ohlc(symbol, date_str):
+    """
+    Fetch OHLC data for Indonesian stocks using yfinance
+    """
+    try:
+        ticker_sym = symbol.upper()
+        if not ticker_sym.endswith('.JK'):
+            ticker_sym = f"{ticker_sym}.JK"
+        
+        stock = yf.Ticker(ticker_sym)
+        
+        # Get last 3 days to ensure we have complete data
+        hist = stock.history(period="3d")
+        
+        if not hist.empty:
+            # Get the last complete bar
+            last_bar = hist.iloc[-1]
+            return {
+                'date': date_str,
+                'open': float(last_bar['Open']),
+                'high': float(last_bar['High']),
+                'low': float(last_bar['Low']),
+                'close': float(last_bar['Close']),
+                'volume': int(last_bar['Volume'])
+            }
+    except Exception as e:
+        print(f"    Error fetching Indo OHLC for {symbol}: {e}")
+    
+    return None
+
+
+def fetch_crypto_ohlc(yf_symbol, date_str):
+    """
+    Fetch OHLC data for cryptocurrency using yfinance
+    Args:
+        yf_symbol: yfinance symbol like "BTC-USD", "ETH-USD"
+        date_str: target date in 'YYYY-MM-DD' format
+    """
+    try:
+        ticker = yf.Ticker(yf_symbol)
+        
+        # Crypto trades 24/7, so fetch last 2 days to be safe
+        hist = ticker.history(period="2d", interval="1d")
+        
+        if not hist.empty:
+            # Get the last complete bar
+            last_bar = hist.iloc[-1]
+            return {
+                'date': date_str,
+                'open': float(last_bar['Open']),
+                'high': float(last_bar['High']),
+                'low': float(last_bar['Low']),
+                'close': float(last_bar['Close']),
+                'volume': int(last_bar['Volume']) if 'Volume' in last_bar else 0
+            }
+    except Exception as e:
+        print(f"    Error fetching crypto OHLC for {yf_symbol}: {e}")
+    
+    return None
+
+
+# ===== Scheduler Setup (runs at midnight) =====
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=daily_sync_job, trigger="cron", hour=0, minute=0)
 scheduler.start()
+
+print("🕐 Scheduler initialized - will run daily at midnight")
 
 # ==================== TECHNICAL ANALYSIS FUNCTIONS ====================
 
@@ -1226,6 +1401,16 @@ def analyze_risk():
 
     except Exception as e:
         print(f"Risk analysis error: {e}")
+        return jsonify({"error": str(e)}), 500
+    
+
+@app.route('/test-sync', methods=['GET'])
+def test_sync():
+    """Manually trigger the daily sync for testing"""
+    try:
+        daily_sync_job()
+        return jsonify({"status": "Sync completed - check logs"})
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
