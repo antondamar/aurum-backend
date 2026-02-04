@@ -97,7 +97,10 @@ def format_currency(value):
 
 # Helper to normalize symbols for Firebase document IDs
 def get_api_symbol(symbol):
-    return symbol.replace('.', '_').replace('/', '_').upper()
+    if symbol in CRYPTO_MAPPINGS:
+        return f"{symbol}-USD"
+    
+    return symbol.upper()
 
 # Missing Fetcher used in AI Insight route
 def get_realtime_price(symbol):
@@ -189,12 +192,34 @@ def daily_sync_job():
                 'last_synced': datetime.now().isoformat()
             })
             
-            # Update daily_prices cache
-            db.collection('daily_prices').document(sym).set({
-                "price": ohlc_data['close'],
-                "date": yesterday,
-                "timestamp": datetime.now().isoformat()
-            })
+            # ✅ FIX: Update daily_prices cache with consistent structure
+            doc_ref = db.collection('daily_prices').document(sym)
+            doc = doc_ref.get()
+
+            if doc.exists:
+                # Append to existing prices array
+                data = doc.to_dict()
+                prices = data.get('prices', [])
+                
+                # Check if date already exists
+                date_exists = any(p.get('date') == yesterday for p in prices)
+                
+                if not date_exists:
+                    prices.append({
+                        'price': ohlc_data['close'],
+                        'date': yesterday
+                    })
+                    # Keep only last 30 days to prevent bloat
+                    prices = sorted(prices, key=lambda x: x['date'])[-30:]
+                    doc_ref.update({'prices': prices})
+            else:
+                # Create new document with prices array structure
+                doc_ref.set({
+                    'prices': [{
+                        'price': ohlc_data['close'],
+                        'date': yesterday
+                    }]
+                })
             
             print(f"  ✅ Updated with {yesterday} data (Close: ${ohlc_data['close']:,.2f})")
             success_count += 1
