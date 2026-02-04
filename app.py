@@ -974,21 +974,6 @@ def get_monthly_data(symbol: str) -> List[Dict]:
 
 # ==================== ENDPOINTS ====================
 
-@app.route('/get-historical-rate', methods=['GET'])
-def get_historical_rate():
-    date = request.args.get('date')
-    target_currency = request.args.get('currency', 'USD')
-    
-    doc = db.collection('exchange_rates').document(date).get()
-    if doc.exists:
-        return jsonify({"rate": doc.to_dict().get(target_currency, 1)})
-    
-    latest_doc = db.collection('exchange_rates').order_by('__name__', direction='DESCENDING').limit(1).get()
-    if latest_doc:
-        return jsonify({"rate": latest_doc[0].to_dict().get(target_currency, 1)})
-
-    return jsonify({"rate": 1})
-
 @app.route('/get-ai-insight', methods=['GET'])
 def get_ai_insight():
     symbol = request.args.get('symbol')
@@ -1504,21 +1489,47 @@ def upload_forex():
     try:
         data = request.get_json()
         payload = data.get('payload', [])
-        
-        # Use a batch to push data efficiently
         batch = db.batch()
         for entry in payload:
             date_str = entry.get('date')
             rates = entry.get('rates')
             if date_str and rates:
                 doc_ref = db.collection('exchange_rates').document(date_str)
-                # merge=True ensures we don't delete existing USD/IDR if only updating CAD
+                # merge=True prevents overwriting other currencies for the same date
                 batch.set(doc_ref, rates, merge=True)
-        
         batch.commit()
         return jsonify({"success": True, "message": f"Uploaded {len(payload)} dates"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/get-historical-rate', methods=['GET'])
+def get_historical_rate():
+    date = request.args.get('date')
+    target_currency = request.args.get('currency', 'USD')
+    
+    # 1. Handle 'latest' request
+    if date == 'latest':
+        latest_doc = db.collection('exchange_rates').order_by('__name__', direction='DESCENDING').limit(1).get()
+        if latest_doc:
+            return jsonify({
+                "rate": latest_doc[0].to_dict().get(target_currency, 1),
+                "date": latest_doc[0].id
+            })
+
+    # 2. Try exact date match
+    doc = db.collection('exchange_rates').document(date).get()
+    if doc.exists:
+        return jsonify({"rate": doc.to_dict().get(target_currency, 1)})
+    
+    # 3. CRITICAL FALLBACK: Look for the closest preceding date
+    # This prevents the 1:1 USD error for recent/missing dates
+    prev_docs = db.collection('exchange_rates').where('__name__', '<=', date).order_by('__name__', direction='DESCENDING').limit(1).get()
+    
+    if prev_docs:
+        return jsonify({"rate": prev_docs[0].to_dict().get(target_currency, 1)})
+
+    # 4. Absolute last resort (should not happen after running the script)
+    return jsonify({"rate": 1})
 
 @app.route('/test-sync', methods=['GET'])
 def test_sync():
