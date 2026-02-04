@@ -75,6 +75,24 @@ def fetch_crypto(coingecko_id):
     res = requests.get(url).json()
     return res.get(coingecko_id, {}).get('usd', 0)
 
+
+def format_currency(value):
+    if value is None: return "N/A"
+    return f"${value:,.2f}"
+
+# Helper to normalize symbols for Firebase document IDs
+def get_api_symbol(symbol):
+    return symbol.replace('.', '_').replace('/', '_').upper()
+
+# Missing Fetcher used in AI Insight route
+def get_realtime_price(symbol):
+    if ".JK" in symbol:
+        return fetch_indo_stock(symbol)
+    elif symbol.isupper(): # Standard US Stock
+        return fetch_us_stock(symbol)
+    return None
+
+
 # ==================== AUTOMATION (Midnight Sync) ====================
 
 def daily_sync_job():
