@@ -91,8 +91,14 @@ def fetch_crypto(coingecko_id):
     return res.get(coingecko_id, {}).get('usd', 0)
 
 
-def format_currency(value):
+def format_currency(value, currency="USD"):
     if value is None: return "N/A"
+    
+    if currency == "IDR":
+        # Format as Rp 10.400 (No decimals for IDR is standard)
+        return f"Rp {value:,.0f}".replace(",", ".")
+    
+    # Default USD/Crypto format: $1,234.56
     return f"${value:,.2f}"
 
 # Helper to normalize symbols for Firebase document IDs
@@ -102,12 +108,31 @@ def get_api_symbol(symbol):
     
     return symbol.upper()
 
-# Missing Fetcher used in AI Insight route
+# Replace this function in app.py
 def get_realtime_price(symbol):
-    if ".JK" in symbol:
-        return fetch_indo_stock(symbol)
-    elif symbol.isupper(): # Standard US Stock
-        return fetch_us_stock(symbol)
+    sym_upper = symbol.upper()
+    
+    # 1. Check if it's a Crypto Asset first
+    # This prevents BTC from being treated as a US Stock
+    if sym_upper in CRYPTO_MAPPINGS:
+        # Use the coingecko_id (the value in your mapping)
+        # Note: In your current app.py, your mapping is "BTC": "BTC-USD"
+        # For Coingecko, you need the ID like "bitcoin"
+        coingecko_id = sym_upper.lower() 
+        if sym_upper == "BTC": coingecko_id = "bitcoin"
+        if sym_upper == "ETH": coingecko_id = "ethereum"
+        # Add other specific mappings as needed or use a better CRYPTO_MAPPINGS
+        
+        return fetch_crypto(coingecko_id)
+
+    # 2. Check if it's an Indonesian Stock
+    if ".JK" in sym_upper:
+        return fetch_indo_stock(sym_upper)
+        
+    # 3. Fallback to US Stock
+    if sym_upper.isupper():
+        return fetch_us_stock(sym_upper)
+        
     return None
 
 # ==================== UNIFIED AUTOMATION (Midnight Sync for ALL Assets) ====================
@@ -329,6 +354,40 @@ scheduler.add_job(func=daily_sync_job, trigger="cron", hour=0, minute=0)
 scheduler.start()
 
 print("🕐 Scheduler initialized - will run daily at midnight")
+
+def sync_historical_data(symbol):
+    try:
+        api_symbol = get_api_symbol(symbol)
+        ticker = yf.Ticker(api_symbol)
+        
+        # Use "max" so the first time an asset is added, you get the full history
+        hist = ticker.history(period="max", interval="1d")
+        
+        if hist.empty:
+            return {"success": False, "error": "No data found on Yahoo Finance"}
+
+        historical_data = []
+        for date, row in hist.iterrows():
+            historical_data.append({
+                "date": date.strftime('%Y-%m-%d'),
+                "open": float(row['Open']),
+                "high": float(row['High']),
+                "low": float(row['Low']),
+                "close": float(row['Close']),
+                "volume": int(row['Volume'])
+            })
+
+        # Save to historical_data so daily_sync_job can find it tomorrow
+        db.collection('historical_data').document(api_symbol).set({
+            "daily": historical_data,
+            "symbol": symbol,
+            "last_synced": datetime.now().isoformat(),
+            "data_source": "on_demand_sync"
+        })
+        
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 # ==================== TECHNICAL ANALYSIS FUNCTIONS ====================
 
@@ -1022,6 +1081,9 @@ def get_ai_insight():
         analysis_df = downsample_to_50_points(df)
         patterns = detect_candlestick_patterns(analysis_df, interval) or ["No patterns detected"]
         
+        is_indo = ".JK" in symbol.upper()
+        display_currency = "IDR" if is_indo else "USD"
+
         # 11. **UPDATED TECHNICAL SUMMARY**
         technical_summary = {
             "symbol": symbol,
@@ -1037,7 +1099,7 @@ def get_ai_insight():
                 "period_label": f"Last {interval_type.lower()} candle",
                 "average_label": f"Avg {interval_type.lower()} volume"
             },
-            "price_formatted": format_currency(current_price),
+            "price_formatted": format_currency(current_price, display_currency),
             "data_period": f"{len(df)} {interval} candles (analyzed: {len(analysis_df)} points)",
             "full_history": f"{len(full_df)} {interval} candles available",
             "data_source": data_dict.get('data_source', 'unknown'),
@@ -1265,8 +1327,18 @@ def local_upload():
         })
         
         asset_ref.set(full_doc_data, merge=False)
-        
-        return jsonify({"success": True, "message": f"Updated {target_field}"})
+
+        if merged_data:
+            latest_item = merged_data[-1] # The last item is the most recent
+            cache_ref = db.collection('daily_prices').document(api_symbol)
+            cache_ref.set({
+                'prices': [{
+                    'price': latest_item['close'],
+                    'date': latest_item['date']
+                }]
+            }, merge=False)
+
+        return jsonify({"success": True, "message": f"Updated {target_field} and Cache"})
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1274,7 +1346,6 @@ def local_upload():
 # ==================== DAILY PRICE CACHE FUNCTIONS ====================
 
 def get_daily_price(symbol: str) -> Optional[float]:
-    """Get today's price from daily cache (fetched by cron)"""
     try:
         doc_ref = db.collection('daily_prices').document(symbol)
         doc = doc_ref.get()
@@ -1282,21 +1353,19 @@ def get_daily_price(symbol: str) -> Optional[float]:
         if doc.exists:
             data = doc.to_dict()
             today = datetime.now().strftime('%Y-%m-%d')
-            
-            # Check if we have today's price
             prices = data.get('prices', [])
+            
+            # 1. Look for today's price specifically
             for price_data in prices:
                 if price_data.get('date') == today:
                     return float(price_data['price'])
             
-            # If not today, return most recent
-            if prices:
-                return float(prices[-1]['price'])
-        
+            # 2. If it's not today, return None so the endpoint 
+            # falls back to a REAL-TIME fetch
+            return None 
+            
         return None
-        
     except Exception as e:
-        print(f"Error getting daily price for {symbol}: {e}")
         return None
 
 @app.route('/get-last-sync/<symbol>', methods=['GET'])
