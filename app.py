@@ -1,270 +1,115 @@
 import os
 import json
+import requests
 import pandas as pd
-import yfinance as yf
+import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from openai import OpenAI
 import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime, timedelta
-import requests
-import time
-import random
-import numpy as np
-from typing import Dict, List, Optional, Tuple
+from apscheduler.schedulers.background import BackgroundScheduler
+import yfinance as yf
 
-# ==================== CONFIGURATION ====================
-ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
-
-# 1. SETUP SESSION
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-})
-
+# ==================== CONFIG & INIT ====================
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:*", "http://127.0.0.1:*", "https://aurum-au.com"])
+CORS(app)
 
-# 2. INITIALIZATION
+POLYGON_KEY = os.getenv("POLYGON_API_KEY")
+SECTORS_KEY = os.getenv("SECTORS_API_KEY")
+
 cred = credentials.Certificate("serviceAccountKey.json")
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def get_api_symbol(symbol: str) -> str:
-    """Convert symbol to yfinance format"""
-    if not symbol:
-        return ""
-    
-    s = symbol.upper().strip()
-    cryptos = ['BTC', 'ETH', 'BNB', 'SOL', 'ADA', 'XRP', 'DOGE', 'DOT', 'LINK', 'LTC']
-    if s in cryptos:
-        return f"{s}-USD"
-    return s
+# ==================== FETCHERS (The New Standard) ====================
 
-def format_currency(value: float) -> str:
-    """Format currency with commas"""
-    if value >= 1000:
-        return f"${value:,.2f}"
-    return f"${value:.2f}"
-
-# ==================== ALPHA VANTAGE FUNCTIONS ====================
-
-def get_alpha_vantage_historical(symbol: str, period: str = "2y") -> Optional[pd.DataFrame]:
-    """Get historical data from Alpha Vantage"""
-    if not ALPHA_VANTAGE_API_KEY:
-        return None
-    
-    try:
-        # Map period to Alpha Vantage output size
-        output_size_map = {
-            "1y": "compact",
-            "2y": "full",
-            "5y": "full",
-            "10y": "full"
-        }
-        
-        output_size = output_size_map.get(period, "full")
-        
-        # Alpha Vantage TIME_SERIES_DAILY endpoint
-        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&outputsize={output_size}&apikey={ALPHA_VANTAGE_API_KEY}"
-        response = session.get(url, timeout=10)
-        data = response.json()
-        
-        if 'Time Series (Daily)' not in data:
-            # Check for error or rate limit
-            if 'Note' in data or 'Information' in data:
-                print(f"Alpha Vantage rate limit or info: {data.get('Note', data.get('Information', 'Unknown'))}")
-                return None
-            print(f"No time series data in response for {symbol}")
-            return None
-        
-        time_series = data['Time Series (Daily)']
-        
-        # Convert to DataFrame
-        records = []
-        for date_str, values in time_series.items():
-            records.append({
-                'date': date_str,
-                'open': float(values['1. open']),
-                'high': float(values['2. high']),
-                'low': float(values['3. low']),
-                'close': float(values['4. close']),
-                'volume': int(float(values['5. volume']))
-            })
-        
-        df = pd.DataFrame(records)
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values('date')
-        
-        return df
-        
-    except Exception as e:
-        print(f"Alpha Vantage historical data error for {symbol}: {e}")
-        return None
-
-def get_yfinance_historical(symbol: str, period: str = "2y") -> Optional[pd.DataFrame]:
-    """Get historical data from yfinance (fallback)"""
-    try:
-        api_symbol = get_api_symbol(symbol)
-        ticker = yf.Ticker(api_symbol, session=session)
-        
-        # Try multiple periods
-        for p in [period, "1y", "6mo", "3mo", "1mo"]:
-            try:
-                hist = ticker.history(period=p, interval="1d")
-                if not hist.empty:
-                    # Convert to our format
-                    df = pd.DataFrame({
-                        'date': hist.index,
-                        'open': hist['Open'].values,
-                        'high': hist['High'].values,
-                        'low': hist['Low'].values,
-                        'close': hist['Close'].values,
-                        'volume': hist['Volume'].values if 'Volume' in hist.columns else 0
-                    })
-                    return df
-            except Exception as e:
-                print(f"yfinance error for period {p}: {e}")
-                continue
-        
-        return None
-        
-    except Exception as e:
-        print(f"yfinance historical data error for {symbol}: {e}")
-        return None
-
-# ==================== FETCH REAL-TIME PRICE ====================
-
-def get_realtime_price(symbol: str) -> Optional[float]:
-    """Fetch real-time price using Alpha Vantage first, then yfinance fallback"""
-    
-    # METHOD 1: Try Alpha Vantage FIRST (if API key is available)
-    if ALPHA_VANTAGE_API_KEY:
-        try:
-            print(f"🔍 Trying Alpha Vantage for {symbol}...")
-            url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
-            response = session.get(url, timeout=10)
-            data = response.json()
-            
-            if 'Global Quote' in data and '05. price' in data['Global Quote']:
-                price = float(data['Global Quote']['05. price'])
-                print(f"✅ Alpha Vantage price for {symbol}: {price}")
-                return price
-            else:
-                print(f"⚠️ Alpha Vantage no data for {symbol}: {data}")
-        except Exception as e:
-            print(f"⚠️ Alpha Vantage error for {symbol}: {e}")
-    else:
-        print("⚠️ No Alpha Vantage API key found")
-    
-    # METHOD 2: Fallback to yfinance
-    try:
-        print(f"🔍 Trying yfinance for {symbol}...")
-        api_symbol = get_api_symbol(symbol)
-        ticker = yf.Ticker(api_symbol, session=session)
-        
-        # Try multiple methods with rate limit handling
-        try:
-            # Method 1: fast_info (fastest)
-            if hasattr(ticker, 'fast_info'):
-                price = ticker.fast_info.get('last_price') or ticker.fast_info.get('regularMarketPrice')
-                if price and price > 0:
-                    print(f"✅ yfinance fast_info price for {symbol}: {price}")
-                    return float(price)
-        except Exception as e:
-            print(f"⚠️ yfinance fast_info failed: {e}")
-        
-        try:
-            # Method 2: info (more reliable but slower)
-            time.sleep(0.5)  # Small delay to avoid rate limits
-            info = ticker.info
-            price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
-            if price and price > 0:
-                print(f"✅ yfinance info price for {symbol}: {price}")
-                return float(price)
-        except Exception as e:
-            print(f"⚠️ yfinance info failed: {e}")
-        
-        try:
-            # Method 3: history last close (fallback)
-            time.sleep(0.5)  # Small delay to avoid rate limits
-            hist = ticker.history(period="1d", interval="1m")
-            if not hist.empty:
-                price = float(hist['Close'].iloc[-1])
-                print(f"✅ yfinance history price for {symbol}: {price}")
-                return price
-        except Exception as e:
-            print(f"⚠️ yfinance history failed: {e}")
-        
-        print(f"❌ All yfinance methods failed for {symbol}")
-        return None
-        
-    except Exception as e:
-        print(f"❌ yfinance completely failed for {symbol}: {e}")
-        return None
-
-# ==================== SYNC FUNCTION ====================
-
-def sync_historical_data(symbol: str) -> Dict:
-    """Smart sync that appends new data to existing history."""
-    try:
-        api_symbol = get_api_symbol(symbol)
-        asset_ref = db.collection('historical_data').document(api_symbol)
-        doc = asset_ref.get()
-        
-        existing_daily = []
-        if doc.exists:
-            data = doc.to_dict()
-            existing_daily = data.get('daily', [])
-            last_synced = datetime.fromisoformat(data.get('last_synced'))
-            # 24-HOUR TIMER: Only sync if it's been a day
-            if datetime.now() - last_synced < timedelta(hours=24):
-                return {"success": True, "source": "firebase_cache", "message": "Using cached 24h data"}
-
-        # FETCH ONLY RECENT DATA (1 Month) TO APPEND
-        # This prevents re-downloading 10 years every time
-        new_df = get_alpha_vantage_historical(symbol, "1mo")
-        if new_df is None or new_df.empty:
-            new_df = get_yfinance_historical(symbol, "1mo")
-            
-        if new_df is None or new_df.empty:
-            return create_mock_historical_data(symbol)
-
-        # CONVERT TO LIST OF DICTS
-        new_points = new_df.to_dict('records')
-        for p in new_points:
-            p['date'] = p['date'].strftime('%Y-%m-%d') if not isinstance(p['date'], str) else p['date']
-
-        # SMART MERGE: Combine, Sort, and Drop Duplicates
-        all_data_df = pd.concat([pd.DataFrame(existing_daily), pd.DataFrame(new_points)])
-        all_data_df = all_data_df.drop_duplicates(subset=['date']).sort_values('date')
-        
-        final_daily = all_data_df.to_dict('records')
-        monthly_data = aggregate_to_monthly(final_daily)
-
-        asset_ref.set({
-            "daily": final_daily,
-            "monthly": monthly_data,
-            "symbol": symbol,
-            "last_synced": datetime.now().isoformat(),
-            "data_points": len(final_daily),
-            "data_source": "hybrid_merge"
-        }, merge=False)
-
-        return {"success": True, "message": f"Appended new data to {symbol}"}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-def create_mock_historical_data(symbol: str) -> Dict:
-    """Returns an error instead of fake data to prevent price inaccuracy."""
-    return {
-        "success": False, 
-        "error": "API Rate Limit reached", 
-        "message": f"Real-time data for {symbol} is currently unavailable. Please try again later."
+def fetch_us_stock(symbol):
+    """
+    Fetches the previous day's aggregate bar for a US stock.
+    Using the Authorization Header method for Massive API.
+    """
+    url = f"https://api.massive.com/v2/aggs/ticker/{symbol}/prev?adjusted=true"
+    headers = {
+        "Authorization": f"Bearer {POLYGON_KEY}"
     }
+    
+    try:
+        res = requests.get(url, headers=headers).json()
+        # Massive follows the Polygon schema: results[0]['c'] is the close price
+        if res.get('status') == 'OK' and 'results' in res:
+            return res['results'][0]['c']
+        return 0
+    except Exception as e:
+        print(f"Error fetching {symbol} from Massive: {e}")
+        return 0
+
+def fetch_indo_stock(symbol):
+    """
+    Fetches the latest close price for Indonesian stocks using yfinance.
+    Example symbol: 'BBCA.JK'
+    """
+    try:
+        # Ensure the symbol has the .JK suffix for Indonesian stocks
+        ticker_sym = symbol if symbol.endswith('.JK') else f"{symbol}.JK"
+        stock = yf.Ticker(ticker_sym)
+        
+        # fast_info is efficient for just the current price
+        price = stock.fast_info.last_price
+        
+        if price is None or price == 0:
+            # Fallback to history if fast_info fails
+            hist = stock.history(period="1d")
+            price = hist['Close'].iloc[-1] if not hist.empty else 0
+            
+        return float(price)
+    except Exception as e:
+        print(f"yfinance error for {symbol}: {e}")
+        return 0
+
+def fetch_crypto(coingecko_id):
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coingecko_id}&vs_currencies=usd"
+    res = requests.get(url).json()
+    return res.get(coingecko_id, {}).get('usd', 0)
+
+# ==================== AUTOMATION (Midnight Sync) ====================
+
+def daily_sync_job():
+    """Triggered every midnight to cache prices and rates in Firebase."""
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    print(f"🚀 Syncing for {today_str}...")
+    
+    # 1. Exchange Rates
+    rates_res = requests.get("https://open.er-api.com/v6/latest/USD").json()
+    if rates_res.get('rates'):
+        db.collection('exchange_rates').document(today_str).set(rates_res['rates'])
+
+    # 2. Daily Price Cache
+    # Suggestion: Fetch all unique symbols from your 'historical_data' collection
+    assets = db.collection('historical_data').stream()
+    for asset in assets:
+        sym = asset.id 
+        price = 0
+        
+        # yfinance logic
+        if ".JK" in sym or sym.isupper(): # simplistic check for stocks
+            if ".JK" in sym:
+                price = fetch_indo_stock(sym)
+            else:
+                price = fetch_us_stock(sym)
+                
+        if price > 0:
+            db.collection('daily_prices').document(sym).set({
+                "price": price,
+                "date": today_str,
+                "timestamp": datetime.now().isoformat()
+            })
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=daily_sync_job, trigger="cron", hour=0, minute=0)
+scheduler.start()
 
 # ==================== TECHNICAL ANALYSIS FUNCTIONS ====================
 
@@ -851,37 +696,18 @@ def get_monthly_data(symbol: str) -> List[Dict]:
 
 # ==================== ENDPOINTS ====================
 
-@app.route('/get-historical-data', methods=['GET'])
-def get_historical_data():
-    """Sync historical data endpoint"""
-    symbol = request.args.get('symbol')
-    if not symbol:
-        return jsonify({"error": "Symbol parameter is required"}), 400
+@app.route('/get-historical-rate', methods=['GET'])
+def get_historical_rate():
+    date = request.args.get('date')
+    target_currency = request.args.get('currency', 'USD')
     
-    try:
-        # Use the new sync function
-        sync_result = sync_historical_data(symbol)
-        
-        if not sync_result.get('success', False):
-            return jsonify({
-                "status": "error",
-                "symbol": symbol,
-                "error": sync_result.get('error', 'Unknown error'),
-                "source": sync_result.get('source', 'unknown'),
-                "message": "Failed to fetch data from any source"
-            }), 503
-        
-        return jsonify({
-            "status": "synced",
-            "symbol": symbol,
-            "data_points": sync_result['data_points'],
-            "source": sync_result['source'],
-            "period": f"{sync_result['data_points']} days",
-            "message": sync_result['message']
-        })
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    # Check Firebase Cache
+    doc = db.collection('exchange_rates').document(date).get()
+    if doc.exists:
+        return jsonify({"rate": doc.to_dict().get(target_currency, 1)})
+    
+    # Fallback/Auto-populate if missing (Optional)
+    return jsonify({"rate": 1, "status": "rate_not_found"})
 
 @app.route('/get-ai-insight', methods=['GET'])
 def get_ai_insight():
@@ -1138,14 +964,9 @@ def get_ai_insight():
         print(f"AI insight error: {e}")
         return jsonify({"error": str(e), "message": "Analysis failed. Please try syncing data first."}), 500
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "alpha_vantage_available": bool(ALPHA_VANTAGE_API_KEY),
-        "alpha_vantage_key_set": bool(ALPHA_VANTAGE_API_KEY)
-    })
+@app.route('/health')
+def health():
+    return {"status": "running", "next_run": str(scheduler.get_jobs()[0].next_run_time)}
 
 # ==================== DIRECT UPDATE ENDPOINT ====================
 @app.route('/direct-update', methods=['POST'])
@@ -1333,8 +1154,6 @@ def get_price_endpoint(symbol: str):
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    
-# app.py - Add this new endpoint
 
 @app.route('/analyze-risk', methods=['POST'])
 def analyze_risk():
