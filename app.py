@@ -979,13 +979,15 @@ def get_historical_rate():
     date = request.args.get('date')
     target_currency = request.args.get('currency', 'USD')
     
-    # Check Firebase Cache
     doc = db.collection('exchange_rates').document(date).get()
     if doc.exists:
         return jsonify({"rate": doc.to_dict().get(target_currency, 1)})
     
-    # Fallback/Auto-populate if missing (Optional)
-    return jsonify({"rate": 1, "status": "rate_not_found"})
+    latest_doc = db.collection('exchange_rates').order_by('__name__', direction='DESCENDING').limit(1).get()
+    if latest_doc:
+        return jsonify({"rate": latest_doc[0].to_dict().get(target_currency, 1)})
+
+    return jsonify({"rate": 1})
 
 @app.route('/get-ai-insight', methods=['GET'])
 def get_ai_insight():
@@ -1496,7 +1498,27 @@ def analyze_risk():
     except Exception as e:
         print(f"Risk analysis error: {e}")
         return jsonify({"error": str(e)}), 500
-    
+
+@app.route('/upload-forex', methods=['POST'])
+def upload_forex():
+    try:
+        data = request.get_json()
+        payload = data.get('payload', [])
+        
+        # Use a batch to push data efficiently
+        batch = db.batch()
+        for entry in payload:
+            date_str = entry.get('date')
+            rates = entry.get('rates')
+            if date_str and rates:
+                doc_ref = db.collection('exchange_rates').document(date_str)
+                # merge=True ensures we don't delete existing USD/IDR if only updating CAD
+                batch.set(doc_ref, rates, merge=True)
+        
+        batch.commit()
+        return jsonify({"success": True, "message": f"Uploaded {len(payload)} dates"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/test-sync', methods=['GET'])
 def test_sync():
