@@ -11,6 +11,7 @@ from firebase_admin import credentials, firestore
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 import yfinance as yf
+from typing import List, Dict, Optional
 
 # ==================== CONFIG & INIT ====================
 app = Flask(__name__)
@@ -99,7 +100,7 @@ def daily_sync_job():
                 price = fetch_indo_stock(sym)
             else:
                 price = fetch_us_stock(sym)
-                
+
         if price > 0:
             db.collection('daily_prices').document(sym).set({
                 "price": price,
