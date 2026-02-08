@@ -137,128 +137,104 @@ def get_realtime_price(symbol):
 
 # ==================== UNIFIED AUTOMATION (Midnight Sync for ALL Assets) ====================
 
-def daily_sync_job():
+def update_historical_database(symbol, new_data, interval='daily'):
     """
-    Triggered every midnight to:
-    1. Update exchange rates
-    2. Fetch OHLC data for ALL assets (stocks + crypto)
-    3. Append to historical_data collection (no duplicates)
-    4. Update daily_prices cache
-    
-    FIREBASE STRUCTURE:
-    - Crypto: "BTC-USD", "ETH-USD" (with hyphen)
-    - US Stocks: "MSFT", "AAPL" (plain symbol)
-    - Indo Stocks: "BBCA.JK", "BMRI.JK" (with dot)
+    Standardized function to push OHLC data into historical_data collection.
+    Structure matches the provided image: historical_data -> {symbol} -> {interval} -> [Array]
     """
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    print(f"🚀 Daily Sync Job Started: {today_str}")
-    print("=" * 60)
-    
-    # ===== 1. Exchange Rates =====
     try:
-        rates_res = requests.get("https://open.er-api.com/v6/latest/USD").json()
-        if rates_res.get('rates'):
-            db.collection('exchange_rates').document(today_str).set(rates_res['rates'])
-            print("✅ Exchange rates updated")
-    except Exception as e:
-        print(f"⚠️  Exchange rates failed: {e}")
-
-    # ===== 2. Get all assets from historical_data =====
-    assets = db.collection('historical_data').stream()
-    
-    success_count = 0
-    skip_count = 0
-    fail_count = 0
-    
-    for asset in assets:
-        sym = asset.id  # e.g., "AAPL", "BBCA.JK", "BTC-USD"
-        asset_data = asset.to_dict()
-        existing_daily = asset_data.get('daily', [])
+        api_symbol = get_api_symbol(symbol)
+        asset_ref = db.collection('historical_data').document(api_symbol)
+        doc = asset_ref.get()
         
-        # Check if we already have yesterday's data
-        existing_dates = {item['date'] for item in existing_daily}
+        target_field = 'monthly' if interval == 'monthly' else 'daily'
         
-        if yesterday in existing_dates:
-            print(f"⏭️  {sym}: Already synced")
-            skip_count += 1
-            continue
+        existing_data = []
+        if doc.exists:
+            existing_data = doc.to_dict().get(target_field, [])
         
-        print(f"📊 Fetching {sym}...")
+        # Merge logic to prevent duplicates based on date string
+        existing_dates = {item['date'] for item in existing_data}
+        merged_data = existing_data.copy()
         
-        # ===== 3. Determine asset type and fetch OHLC =====
-        ohlc_data = None
+        for item in new_data:
+            if item['date'] not in existing_dates:
+                merged_data.append(item)
         
-        # CRYPTO: Contains hyphen with USD (e.g., "BTC-USD", "ETH-USD")
-        if "-USD" in sym or "-USDT" in sym:
-            ohlc_data = fetch_crypto_ohlc(sym, yesterday)
+        # Keep data sorted by date
+        merged_data.sort(key=lambda x: x['date'])
         
-        # INDONESIAN STOCK: Contains ".JK" (e.g., "BBCA.JK", "BMRI.JK")
-        elif ".JK" in sym:
-            ohlc_data = fetch_indo_ohlc(sym, yesterday)
+        # Update Firebase
+        asset_ref.set({
+            target_field: merged_data,
+            "last_synced": datetime.now().isoformat()
+        }, merge=True)
         
-        # US STOCK: Plain uppercase letters (e.g., "AAPL", "MSFT")
-        elif sym.isalpha() and sym.isupper():
-            ohlc_data = fetch_us_ohlc(sym, yesterday)
-        
-        else:
-            print(f"  ⚠️  Unknown symbol format: {sym}")
-            fail_count += 1
-            continue
-        
-        # ===== 4. Update Firebase if we got valid data =====
-        if ohlc_data and ohlc_data['close'] > 0:
-            existing_daily.append(ohlc_data)
-            existing_daily.sort(key=lambda x: x['date'])
-            
-            # Update historical_data collection
-            db.collection('historical_data').document(sym).update({
-                'daily': existing_daily,
-                'last_synced': datetime.now().isoformat()
+        # Update daily_prices only for current price reference, not long history
+        if merged_data and interval == 'daily':
+            latest = merged_data[-1]
+            db.collection('daily_prices').document(api_symbol).set({
+                'price': latest['close'],
+                'date': latest['date']
             })
             
-            # ✅ FIX: Update daily_prices cache with consistent structure
-            doc_ref = db.collection('daily_prices').document(sym)
-            doc = doc_ref.get()
-
-            if doc.exists:
-                # Append to existing prices array
-                data = doc.to_dict()
-                prices = data.get('prices', [])
-                
-                # Check if date already exists
-                date_exists = any(p.get('date') == yesterday for p in prices)
-                
-                if not date_exists:
-                    prices.append({
-                        'price': ohlc_data['close'],
-                        'date': yesterday
-                    })
-                    # Keep only last 30 days to prevent bloat
-                    prices = sorted(prices, key=lambda x: x['date'])[-30:]
-                    doc_ref.update({'prices': prices})
-            else:
-                # Create new document with prices array structure
-                doc_ref.set({
-                    'prices': [{
-                        'price': ohlc_data['close'],
-                        'date': yesterday
-                    }]
-                })
-            
-            print(f"  ✅ Updated with {yesterday} data (Close: ${ohlc_data['close']:,.2f})")
-            success_count += 1
-        else:
-            print(f"  ⚠️  No data available")
-            fail_count += 1
+        return True
+    except Exception as e:
+        print(f"Error updating database for {symbol}: {e}")
+        return False
     
-    # ===== 5. Summary =====
-    print("=" * 60)
-    print(f"🎯 Sync Complete!")
-    print(f"   ✅ Updated: {success_count}")
-    print(f"   ⏭️  Skipped: {skip_count}")
-    print(f"   ⚠️  Failed: {fail_count}")
-    print("=" * 60)
+def daily_sync_job():
+    """
+    Automated midnight job for forward-filling daily and monthly data.
+    Uses a 7-day window for daily and 2-month window for monthly to catch all market closes.
+    """
+    print(f"🚀 Starting Midnight Sync: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Stream symbols directly from your historical_data collection
+    symbols = [doc.id for doc in db.collection('historical_data').stream()]
+    
+    for sym in symbols:
+        try:
+            ticker = yf.Ticker(sym)
+            
+            # 1. Fetch Daily Data (7-day window to handle weekend gaps)
+            hist_daily = ticker.history(period="7d", interval="1d")
+            if not hist_daily.empty:
+                daily_list = [{
+                    "date": d.strftime('%Y-%m-%d'), 
+                    "open": float(r['Open']), 
+                    "high": float(r['High']), 
+                    "low": float(r['Low']), 
+                    "close": float(r['Close']), 
+                    "volume": int(r['Volume'])
+                } for d, r in hist_daily.iterrows()]
+                
+                # Push to historical_data -> daily array
+                update_historical_database(sym, daily_list, interval='daily')
+            
+            # 2. Fetch Monthly Data (2-month window to catch the latest monthly close)
+            hist_monthly = ticker.history(period="2mo", interval="1mo")
+            if not hist_monthly.empty:
+                monthly_list = [{
+                    "date": d.strftime('%Y-%m-%d'), 
+                    "open": float(r['Open']), 
+                    "high": float(r['High']), 
+                    "low": float(r['Low']), 
+                    "close": float(r['Close']), 
+                    "volume": int(r['Volume'])
+                } for d, r in hist_monthly.iterrows()]
+                
+                # Push to historical_data -> monthly array
+                update_historical_database(sym, monthly_list, interval='monthly')
+                
+            # Protection against Yahoo Finance rate limits
+            time.sleep(1) 
+            
+        except Exception as e:
+            print(f"❌ Error in daily_sync_job for {sym}: {e}")
+
+    print(f"🏁 Midnight Sync Complete: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
 
 
 def fetch_us_ohlc(symbol, date_str):
@@ -1435,53 +1411,51 @@ def analyze_risk():
     try:
         data = request.get_json()
         answers = data.get('answers', {})
-        portfolio = data.get('portfolio', [])
+        allocation = data.get('currentAllocation', {})
         
-        # 1. Format user data for the prompt
-        quiz_summary = "\n".join([f"- {q}: {a}" for q, a in answers.items()])
-        
-        portfolio_summary = "User currently has no assets."
-        if portfolio:
-            portfolio_summary = "\n".join([
-                f"- {p['name']}: {len(p['assets'])} assets, Total Value: ${sum(a['value'] for a in p['assets']):,.2f}"
-                for p in portfolio
-            ])
+        # Format the current state for the AI
+        current_summary = f"""
+        - Crypto: ${allocation.get('crypto', 0):,.2f}
+        - Stocks: ${allocation.get('stocks', 0):,.2f}
+        - Cash: ${allocation.get('cash', 0):,.2f}
+        - Total Value: ${allocation.get('total', 0):,.2f}
+        """
 
-        # 2. Build the AI Prompt
         prompt = f"""
-        Act as a professional Wealth Manager. Analyze this user's risk profile and portfolio.
+        Act as Aurum AI, a high-end wealth manager.
         
-        USER PROFILE DATA:
-        {quiz_summary}
+        USER PROFILE:
+        {json.dumps(answers, indent=2)}
         
-        CURRENT PORTFOLIO STRUCTURE:
-        {portfolio_summary}
+        CURRENT PORTFOLIO ALLOCATION:
+        {current_summary}
         
         TASK:
-        1. Assess their Risk Category (Conservative, Moderate, or Aggressive).
-        2. Compare their current portfolio to their risk profile.
-        3. Suggest a target asset allocation (e.g., % Stocks, % Crypto, % Cash).
-        4. Provide 3 actionable steps to align their portfolio with their risk tolerance.
+        1. Determine their Risk Category (Conservative, Moderate, or Aggressive).
+        2. Analyze if their current allocation matches their profile.
+        3. Suggest a specific "Ideal Allocation" percentage split.
+        4. Provide 3 high-impact actionable steps.
 
-        CONSTRAINTS:
-        - Be objective and professional.
-        - Your 'verdict' must be under 200 words.
-        - Respond ONLY in valid JSON format.
+        RESPONSE FORMAT (JSON ONLY):
+        {{
+          "risk_profile": "string",
+          "verdict": "string (max 150 words)",
+          "ideal_allocation": {{ "crypto": "XX%", "stocks": "XX%", "cash": "XX%" }},
+          "action_steps": ["step 1", "step 2", "step 3"]
+        }}
         """
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a financial risk expert. Respond in JSON."},
+                {"role": "system", "content": "You are a senior investment strategist. Respond only in JSON."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"}
         )
 
         return jsonify(json.loads(response.choices[0].message.content))
-
     except Exception as e:
-        print(f"Risk analysis error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/upload-forex', methods=['POST'])
@@ -1530,6 +1504,44 @@ def get_historical_rate():
 
     # 4. Absolute last resort (should not happen after running the script)
     return jsonify({"rate": 1})
+
+@app.route('/trigger-full-sync', methods=['POST'])
+def trigger_full_sync():
+    """
+    Triggers the deep sync for Daily and Monthly history across all tracked symbols.
+    This incorporates the logic from your weekly_update.py.
+    """
+    data = request.get_json()
+    symbols = data.get('symbols', []) # Optional: pass specific symbols
+    
+    # If no symbols provided, sync everything in the library
+    if not symbols:
+        symbols = [doc.id for doc in db.collection('historical_data').stream()]
+
+    results = []
+    for sym in symbols:
+        ticker = yf.Ticker(sym)
+        
+        # Fetch Daily (Gap Fill)
+        hist_daily = ticker.history(period="60d", interval="1d")
+        daily_list = [{"date": d.strftime('%Y-%m-%d'), "open": r['Open'], "high": r['High'], 
+                       "low": r['Low'], "close": r['Close'], "volume": int(r['Volume'])} 
+                      for d, r in hist_daily.iterrows()]
+        
+        # Fetch Monthly (Deep History)
+        hist_monthly = ticker.history(period="max", interval="1mo")
+        monthly_list = [{"date": d.strftime('%Y-%m-%d'), "open": r['Open'], "high": r['High'], 
+                         "low": r['Low'], "close": r['Close'], "volume": int(r['Volume'])} 
+                        for d, r in hist_monthly.iterrows()]
+        
+        # Execute push to correct collection
+        d_res = update_historical_database(sym, daily_list, 'daily')
+        m_res = update_historical_database(sym, monthly_list, 'monthly')
+        
+        results.append({"symbol": sym, "daily": d_res, "monthly": m_res})
+        time.sleep(1) # Rate limit protection
+
+    return jsonify({"status": "Sync Complete", "results": results})
 
 @app.route('/test-sync', methods=['GET'])
 def test_sync():
