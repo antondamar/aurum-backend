@@ -1422,7 +1422,7 @@ def analyze_risk():
         """
 
         prompt = f"""
-        Act as Aurum AI, a high-end wealth manager.
+        Act as a high-end wealth manager.
         
         USER PROFILE:
         {json.dumps(answers, indent=2)}
@@ -1439,7 +1439,7 @@ def analyze_risk():
         RESPONSE FORMAT (JSON ONLY):
         {{
           "risk_profile": "string",
-          "verdict": "string (max 150 words)",
+          "verdict": "string",
           "ideal_allocation": {{ "crypto": "XX%", "stocks": "XX%", "cash": "XX%" }},
           "action_steps": ["step 1", "step 2", "step 3"]
         }}
